@@ -531,7 +531,7 @@ def _ts_file() -> str:
 def _print_status(msg: str) -> None:
     """Coloured status line. Falls back gracefully if rich isn't installed."""
     try:
-        from rich.console import Console
+        from rich.console import Console  # type: ignore
         Console().print(f"[dim]{msg}[/dim]")
     except ImportError:
         print(msg)
