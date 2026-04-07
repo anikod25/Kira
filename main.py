@@ -15,6 +15,7 @@ import os
 import subprocess
 import sys
 import time
+import shutil
 import shlex
 from datetime import datetime
 from pathlib import Path
@@ -538,6 +539,10 @@ class KiraAgent:
         Run searchsploit against every service version in state,
         store results as vulnerability Findings, return a summary.
         """
+
+        if shutil.which("searchsploit") is None:
+            return "searchsploit not available on this system (skipping vuln_scan)"
+
         services: dict = self.state.state["findings"].get("services", {})
         if not services:
             return "No services in state yet — run an nmap scan first"
