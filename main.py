@@ -43,7 +43,7 @@ class C:
     RESET   = "\033[0m"
 
 BANNER = f"""
-{C.RED}{C.BOLD}  _  ___           
+{C.BLUE}{C.BOLD}  _  ___           
  | |/ (_)_ _ __ _ 
  | ' <| | '_/ _` |
  |_|\_\_|_| \__,_|{C.RESET}
@@ -56,9 +56,13 @@ BANNER = f"""
 
 def setup_logging(output_dir: Path, verbose: bool) -> logging.Logger:
     log_path = output_dir / "kira.log"
-    handlers = [logging.FileHandler(log_path)]
+    handlers = [logging.FileHandler(log_path, encoding='utf-8')]
     if verbose:
         handlers.append(logging.StreamHandler(sys.stdout))
+
+    # Ensure stdout can handle UTF-8
+    if hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(encoding='utf-8')
 
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
@@ -336,7 +340,7 @@ class KiraAgent:
         ollama_host: str,
         start_phase: str,
         verbose: bool,
-        max_iterations: int = 30,
+        max_iterations: int = 5,
     ):
         self.target = target
         self.output_dir = output_dir
@@ -499,6 +503,7 @@ class KiraAgent:
 
             # Execute
             result = self._dispatch(action)
+            print(result)
             self.state.log_action(tool, action.get("args", {}), result, action.get("reasoning", ""))
 
             if result == "DONE":
@@ -552,8 +557,8 @@ def parse_args():
     parser.add_argument(
         "--max-iter",
         type=int,
-        default=30,
-        help="Maximum agent loop iterations (default: 30)",
+        default=5,
+        help="Maximum agent loop iterations (default: 5)",
     )
     parser.add_argument("--verbose", "-v", action="store_true", help="Print logs to stdout")
     parser.add_argument("--version", action="version", version=f"Kira {VERSION}")
