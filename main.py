@@ -15,6 +15,7 @@ import os
 import subprocess
 import sys
 import time
+import shlex
 from datetime import datetime
 from pathlib import Path
 
@@ -70,6 +71,7 @@ def setup_logging(output_dir: Path, verbose: bool) -> logging.Logger:
         sys.stdout.reconfigure(encoding='utf-8')
 
     logging.basicConfig(
+        force=True,
         level=logging.DEBUG if verbose else logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
         datefmt="%H:%M:%S",
@@ -139,7 +141,13 @@ class StateManager:
         return self.state.get(key, default)
 
     def add_finding(self, category: str, finding):
-        self.state["findings"][category].append(finding)
+        container = self.state["findings"].get(category)
+
+        if isinstance(container, list):
+            container.append(finding)
+        elif isinstance(container, dict):
+            raise TypeError(f"Cannot append to dict-based category: {category}")
+
         self.save()
 
     def set_service(self, port: str, version_string: str):
@@ -370,7 +378,11 @@ Rules:
                 with urllib.request.urlopen(req, timeout=timeout) as resp:
                     body = json.loads(resp.read())
                     content = body["message"]["content"]
-                    action = json.loads(content)
+                    try:
+                        action = json.loads(content)
+                    except Exception:
+                        self.logger.error(f"[LLM RAW OUTPUT] {content}")
+                        return self._fallback_action()
                     self.logger.debug(f"[LLM] decided: {action}")
                     return action
             except json.JSONDecodeError:
@@ -463,7 +475,7 @@ class KiraAgent:
             command = args.get("command", "")
             if not command:
                 return "no command provided"
-            stdout, stderr, rc = self.executor.run(command.split(), "shell")
+            stdout, stderr, rc = self.executor.run(shlex.split(command), "shell")
             return stdout or stderr
 
         elif tool == "advance_phase":
@@ -543,7 +555,9 @@ class KiraAgent:
             fd = f.to_dict()
             # Avoid duplicates: check by port
             existing_ports = [
-                v.get("port") for v in self.state.state["findings"]["vulnerabilities"]
+                v.get("port")
+                for v in self.state.state["findings"]["vulnerabilities"]
+                if isinstance(v, dict)
             ]
             if fd["port"] not in existing_ports:
                 self.state.add_finding("vulnerabilities", fd)
@@ -567,7 +581,7 @@ class KiraAgent:
         out = self.executor.gobuster(url, wordlist)
         out_path = self.output_dir / "gobuster.txt"
         if out_path.exists():
-            with open(out_path) as f:
+            with open(out_path, encoding="utf-8") as f:
                 dirs = [
                     line.split()[0].strip()
                     for line in f
