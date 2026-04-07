@@ -28,15 +28,28 @@ VERSION = "0.1.0"
 
 PHASES = ["recon", "enumeration", "exploitation", "privesc", "report"]
 
-BANNER = r"""
-  _  ___           
+# Add this near the top of main.py, after imports
+
+class C:
+    RED     = "\033[91m"
+    GREEN   = "\033[92m"
+    YELLOW  = "\033[93m"
+    BLUE    = "\033[94m"
+    MAGENTA = "\033[95m"
+    CYAN    = "\033[96m"
+    WHITE   = "\033[97m"
+    BOLD    = "\033[1m"
+    DIM     = "\033[2m"
+    RESET   = "\033[0m"
+
+BANNER = f"""
+{C.RED}{C.BOLD}  _  ___           
  | |/ (_)_ _ __ _ 
  | ' <| | '_/ _` |
- |_|\_\_|_| \__,_|
-  Autonomous Pentest Agent v{version}
-  [!] Authorized environments only
+ |_|\_\_|_| \__,_|{C.RESET}
+{C.DIM}  Autonomous Pentest Agent v{VERSION}{C.RESET}
+{C.YELLOW}  [!] Authorized environments only{C.RESET}
 """
-
 # ─────────────────────────────────────────────
 # Logging setup
 # ─────────────────────────────────────────────
@@ -549,13 +562,12 @@ def parse_args():
 
 def main():
     print(BANNER.format(version=VERSION))
+    print(f"{C.DIM}{'─' * 45}{C.RESET}")
+    print(f"  {C.YELLOW}WARNING:{C.RESET} For authorized environments only.")
+    print(f"  Unauthorized use is illegal.")
+    print(f"{C.DIM}{'─' * 45}{C.RESET}")
+    confirm = input(f"\n  Confirm target is authorized {C.GREEN}[y/N]{C.RESET}: ").strip().lower()
 
-    # Ethical usage gate
-    print("─" * 45)
-    print("  WARNING: For authorized environments only.")
-    print("  Unauthorized use is illegal.")
-    print("─" * 45)
-    confirm = input("\n  Confirm target is authorized [y/N]: ").strip().lower()
     if confirm != "y":
         print("Aborted.")
         sys.exit(0)
