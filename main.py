@@ -19,6 +19,11 @@ from datetime import datetime
 from pathlib import Path
 
 from kira.parsers.nmap_parser import NmapParser, NmapResult
+from kira.parsers.vuln_scanner import (   # ← Phase 5
+    scan_services,
+    ToolRunner as VulnToolRunner,
+    KnowledgeBase,
+)
 
 # ─────────────────────────────────────────────
 # Constants
@@ -83,6 +88,7 @@ class StateManager:
     def __init__(self, state_path: Path):
         self.path = state_path
         self.state = self._default_state()
+        self._dirty = False
         if state_path.exists():
             self._load()
 
@@ -93,9 +99,9 @@ class StateManager:
             "completed_phases": [],
             "findings": {
                 "open_ports": [],
-                "services": [],
+                "services": {},          # ← Phase 5: port → version_string map
                 "directories": [],
-                "vulnerabilities": [],
+                "vulnerabilities": [],   # ← Phase 5: Finding dicts stored here
                 "credentials": [],
                 "exploits_attempted": [],
                 "flags": [],
@@ -109,10 +115,21 @@ class StateManager:
     def _load(self):
         with open(self.path) as f:
             self.state = json.load(f)
+        # Back-compat: ensure services dict exists for older state files
+        self.state["findings"].setdefault("services", {})
 
-    def save(self):
-        with open(self.path, "w") as f:
-            json.dump(self.state, f, indent=2)
+    def save(self, force: bool = False):
+        self._dirty = True
+        if force:
+            with open(self.path, "w") as f:
+                json.dump(self.state, f, indent=2)
+            self._dirty = False
+
+    def flush(self, force: bool = False):
+        if self._dirty or force:
+            with open(self.path, "w") as f:
+                json.dump(self.state, f, indent=2)
+            self._dirty = False
 
     def set(self, key: str, value):
         self.state[key] = value
@@ -121,8 +138,13 @@ class StateManager:
     def get(self, key: str, default=None):
         return self.state.get(key, default)
 
-    def add_finding(self, category: str, finding: dict):
+    def add_finding(self, category: str, finding):
         self.state["findings"][category].append(finding)
+        self.save()
+
+    def set_service(self, port: str, version_string: str):
+        """Register a port → version string for vuln_scanner consumption."""
+        self.state["findings"]["services"][port] = version_string
         self.save()
 
     def log_action(self, tool: str, args: dict, result: str, reasoning: str = ""):
@@ -130,7 +152,7 @@ class StateManager:
             "timestamp": datetime.now().isoformat(),
             "tool": tool,
             "args": args,
-            "result_summary": result[:300],  # keep state file lean
+            "result_summary": result[:300],
             "reasoning": reasoning,
         }
         self.state["actions_taken"].append(entry)
@@ -153,7 +175,7 @@ class StateManager:
             "",
             f"Open ports ({len(findings['open_ports'])}):",
         ]
-        for p in findings["open_ports"][:10]:  # cap at 10
+        for p in findings["open_ports"][:10]:
             lines.append(f"  {p.get('port')}/{p.get('protocol')} {p.get('service')} {p.get('product','')} {p.get('version','')}".rstrip())
 
         if findings["directories"]:
@@ -164,7 +186,14 @@ class StateManager:
         if findings["vulnerabilities"]:
             lines.append(f"\nVulnerabilities ({len(findings['vulnerabilities'])}):")
             for v in findings["vulnerabilities"][:5]:
-                lines.append(f"  [{v.get('severity','?')}] {v.get('title','?')}")
+                # Support both old-style dicts and new Finding dicts
+                title = v.get("title") or v.get("version_string", "?")
+                sev   = v.get("severity") or (
+                    f"CVSS {v['cvss_estimate']}" if v.get("cvss_estimate") else "?"
+                )
+                cve   = f" [{v['cve']}]" if v.get("cve") else ""
+                msf   = " [MSF]" if v.get("exploit_available") else ""
+                lines.append(f"  [{sev}]{cve}{msf} {title}")
 
         if s["actions_taken"]:
             last3 = s["actions_taken"][-3:]
@@ -195,9 +224,6 @@ class ToolExecutor:
         self.timeout = timeout
 
     def run(self, command: list[str], label: str) -> tuple[str, str, int]:
-        """
-        Execute a shell command, stream stdout to log, return (stdout, stderr, returncode).
-        """
         self.logger.info(f"[EXEC] {' '.join(command)}")
         try:
             proc = subprocess.Popen(
@@ -231,7 +257,7 @@ class ToolExecutor:
     def nmap_full(self, target: str) -> Path:
         xml_out = self.output_dir / "nmap_full.xml"
         command = [
-            "nmap", "-sV", "-sC", "-p-",
+            "nmap", "-sV", "-p-",
             "--min-rate", "1000",
             "-oX", str(xml_out),
             target,
@@ -267,6 +293,7 @@ Available tools:
   nmap_initial   — Fast version/script scan. Args: {target: str}
   nmap_full      — Full port scan (-p-). Args: {target: str}
   gobuster       — Directory brute-force. Args: {url: str, wordlist: str (optional)}
+  vuln_scan      — CVE cross-reference via searchsploit. Args: {} (reads services from state)
   metasploit     — Run an MSF module. Args: {module: str, options: dict}
   run_shell      — Run arbitrary shell command. Args: {command: str}
   advance_phase  — Move to next pentest phase. Args: {}
@@ -282,6 +309,7 @@ Rules:
 - Always reply with ONLY valid JSON — no prose, no markdown fences.
 - Format: {"tool": "<name>", "args": {<key>: <value>}, "reasoning": "<1 sentence>"}
 - Be methodical: recon → enumeration → exploitation → privesc → report.
+- After nmap scans populate services, run vuln_scan before attempting exploitation.
 - Do not repeat an action already taken unless you have new information.
 - If you have enough recon data, call advance_phase to move forward.
 """ + TOOL_SCHEMA
@@ -290,8 +318,32 @@ Rules:
         self.host = host.rstrip("/")
         self.model = model
         self.logger = logger or logging.getLogger("kira.planner")
+        self._health_checked = False
+
+    def health_check(self) -> bool:
+        if self._health_checked:
+            return True
+        try:
+            import urllib.request
+            req = urllib.request.Request(f"{self.host}/api/tags")
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                body = json.loads(resp.read())
+                models = [m["name"] for m in body.get("models", [])]
+                if self.model not in models:
+                    self.logger.warning(f"[LLM] Model '{self.model}' not found. Available: {models}")
+                    return False
+                self._health_checked = True
+                self.logger.info(f"[LLM] Connected — model '{self.model}' ready")
+                return True
+        except Exception as e:
+            self.logger.error(f"[LLM] Health check failed (Ollama not running?): {e}")
+            return False
 
     def decide(self, context: str) -> dict:
+        if not self._health_checked and not self.health_check():
+            self.logger.warning("[LLM] Ollama unavailable — using fallback")
+            return self._fallback_action()
+
         prompt = f"Current pentest state:\n{context}\n\nWhat is the single best next action?"
         payload = {
             "model": self.model,
@@ -303,29 +355,47 @@ Rules:
             "format": "json",
         }
 
-        try:
-            import urllib.request
-            data = json.dumps(payload).encode()
-            req = urllib.request.Request(
-                f"{self.host}/api/chat",
-                data=data,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                body = json.loads(resp.read())
-                content = body["message"]["content"]
-                action = json.loads(content)
-                self.logger.debug(f"[LLM] decided: {action}")
-                return action
-        except Exception as e:
-            self.logger.error(f"[LLM] failed: {e}")
-            # Safe fallback: continue with nmap if planner is down
-            return {
-                "tool": "nmap_initial",
-                "args": {},
-                "reasoning": "LLM unavailable — falling back to initial scan",
-            }
+        max_retries = 2
+        for attempt in range(max_retries + 1):
+            try:
+                import urllib.request
+                data = json.dumps(payload).encode()
+                req = urllib.request.Request(
+                    f"{self.host}/api/chat",
+                    data=data,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                timeout = 35 if attempt == 0 else 15
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    body = json.loads(resp.read())
+                    content = body["message"]["content"]
+                    action = json.loads(content)
+                    self.logger.debug(f"[LLM] decided: {action}")
+                    return action
+            except json.JSONDecodeError:
+                if attempt < max_retries:
+                    self.logger.warning(f"[LLM] JSON parse error (attempt {attempt+1}), retrying...")
+                    time.sleep(0.1)
+                    continue
+                self.logger.error(f"[LLM] Failed to parse JSON after {max_retries+1} attempts")
+                return self._fallback_action()
+            except Exception as e:
+                if attempt < max_retries:
+                    self.logger.warning(f"[LLM] Request failed (attempt {attempt+1}): {e}")
+                    time.sleep(0.1)
+                    continue
+                self.logger.error(f"[LLM] failed: {e}")
+                return self._fallback_action()
+
+        return self._fallback_action()
+
+    def _fallback_action(self) -> dict:
+        return {
+            "tool": "nmap_initial",
+            "args": {},
+            "reasoning": "LLM unavailable — falling back to initial scan",
+        }
 
 
 # ─────────────────────────────────────────────
@@ -353,7 +423,10 @@ class KiraAgent:
         self.executor = ToolExecutor(output_dir, self.logger)
         self.planner = LLMPlanner(host=ollama_host, logger=self.logger)
 
-        # Initialise state
+        # Phase 5: shared vuln scanner helpers
+        self._vuln_runner = VulnToolRunner()
+        self._vuln_kb     = KnowledgeBase()
+
         self.state.set("target", target)
         if self.state.get("phase") == "recon" and start_phase:
             self.state.set("phase", start_phase)
@@ -377,6 +450,9 @@ class KiraAgent:
             url = args.get("url", f"http://{self.target}")
             wordlist = args.get("wordlist", "/usr/share/wordlists/dirb/common.txt")
             return self._do_gobuster(url, wordlist)
+
+        elif tool == "vuln_scan":                          # ← Phase 5
+            return self._do_vuln_scan()
 
         elif tool == "metasploit":
             module = args.get("module", "")
@@ -428,15 +504,67 @@ class KiraAgent:
         return f"Full scan: {len(result.open_ports())} open ports"
 
     def _ingest_nmap(self, result: NmapResult):
+        """Store open ports AND build the services dict for vuln_scanner."""
         for p in result.open_ports():
-            # Deduplicate by port number
+            # Deduplicate open_ports list by port number
             existing = [x["port"] for x in self.state.state["findings"]["open_ports"]]
             if p["port"] not in existing:
                 self.state.add_finding("open_ports", p)
 
+            # Build version string for vuln_scanner: "Product Version"
+            product = p.get("product", "").strip()
+            version = p.get("version", "").strip()
+            if product or version:
+                version_string = f"{product} {version}".strip()
+                port_key = f"{p['port']}/{p.get('protocol', 'tcp')}"
+                self.state.set_service(port_key, version_string)
+
+    # ── Phase 5: CVE cross-reference ─────────
+
+    def _do_vuln_scan(self) -> str:
+        """
+        Run searchsploit against every service version in state,
+        store results as vulnerability Findings, return a summary.
+        """
+        services: dict = self.state.state["findings"].get("services", {})
+        if not services:
+            return "No services in state yet — run an nmap scan first"
+
+        self.logger.info(f"[VULN] Scanning {len(services)} service(s) via searchsploit")
+        print(f"\n  {C.CYAN}[vuln_scan]{C.RESET} Checking {len(services)} service version(s)...")
+
+        findings = scan_services(services, self._vuln_runner, self._vuln_kb)
+
+        if not findings:
+            return "searchsploit returned no results for discovered services"
+
+        stored = 0
+        for f in findings:
+            fd = f.to_dict()
+            # Avoid duplicates: check by port
+            existing_ports = [
+                v.get("port") for v in self.state.state["findings"]["vulnerabilities"]
+            ]
+            if fd["port"] not in existing_ports:
+                self.state.add_finding("vulnerabilities", fd)
+                stored += 1
+
+        # Human-readable summary
+        lines = [f"vuln_scan: {stored} new finding(s) from {len(findings)} service(s)"]
+        for f in findings:
+            msf = " [MSF AVAILABLE]" if f.exploit_available else ""
+            cve = f" {f.cve}" if f.cve else ""
+            lines.append(
+                f"  {f.port} | {f.version_string}{cve}{msf} | "
+                f"CVSS~{f.cvss_estimate} | {len(f.edb_ids)} exploit(s)"
+            )
+
+        summary = "\n".join(lines)
+        self.logger.info(f"[VULN] {summary}")
+        return summary
+
     def _do_gobuster(self, url: str, wordlist: str) -> str:
         out = self.executor.gobuster(url, wordlist)
-        # Parse output file line by line
         out_path = self.output_dir / "gobuster.txt"
         if out_path.exists():
             with open(out_path) as f:
@@ -453,7 +581,6 @@ class KiraAgent:
     def _do_metasploit(self, module: str, options: dict) -> str:
         if not module:
             return "no module specified"
-        # Build resource script
         rc_path = self.output_dir / "exploit.rc"
         out_path = self.output_dir / "msf_output.txt"
         lines = [f"use {module}"]
@@ -467,7 +594,6 @@ class KiraAgent:
             "metasploit",
         )
         result_text = out_path.read_text() if out_path.exists() else stdout
-        # Basic success detection
         success = any(kw in result_text for kw in ["Meterpreter session", "Command shell session", "root@"])
         status = "SUCCESS" if success else "no session"
         self.state.add_finding("exploits_attempted", {
@@ -478,7 +604,7 @@ class KiraAgent:
         return f"MSF {module}: {status}\n{result_text[:500]}"
 
     def _do_generate_report(self) -> str:
-        from kira.reporter import generate_report  # imported lazily (Day 4 module)
+        from kira.reporter import generate_report
         report_path = generate_report(self.state.state, self.output_dir)
         return f"Report written to {report_path}"
 
@@ -495,30 +621,29 @@ class KiraAgent:
             self.logger.info(f"── Iteration {i}/{self.max_iterations} | phase={phase} ──")
             print(f"[{i:02d}] Phase: {phase}", end="  ", flush=True)
 
-            # Get LLM decision
             context = self.state.get_context_summary()
             action = self.planner.decide(context)
             tool = action.get("tool", "unknown")
             print(f"→ {tool}")
 
-            # Execute
             result = self._dispatch(action)
             print(result)
             self.state.log_action(tool, action.get("args", {}), result, action.get("reasoning", ""))
+
+            self.state.flush()
 
             if result == "DONE":
                 self.logger.info("Agent signalled DONE")
                 print("\n[✓] Agent completed — target fully processed")
                 break
 
-            # Small delay to avoid hammering the LLM
-            time.sleep(1)
+            time.sleep(0.1)
 
         else:
             self.logger.warning("Max iterations reached")
             print(f"\n[!] Max iterations ({self.max_iterations}) reached")
 
-        # Always print final state summary
+        self.state.flush(force=True)
         print("\n── Final Findings ──────────────────────")
         print(self.state.get_context_summary())
         print(f"\n[*] Full log: {self.output_dir / 'kira.log'}")
@@ -578,7 +703,6 @@ def main():
         sys.exit(0)
 
     args = parse_args()
-
     output_dir = Path(args.output) / args.target.replace(".", "_")
 
     agent = KiraAgent(
@@ -589,6 +713,14 @@ def main():
         verbose=args.verbose,
         max_iterations=args.max_iter,
     )
+
+    print(f"\n{C.BLUE}[*] Checking Ollama connectivity...{C.RESET}")
+    if not agent.planner.health_check():
+        print(f"{C.RED}[!] ERROR: Ollama is not responding!{C.RESET}")
+        print(f"    Start Ollama with: {C.CYAN}ollama serve{C.RESET}")
+        print(f"    Pull the model with: {C.CYAN}ollama pull gemma3:4b{C.RESET}")
+        sys.exit(1) 
+
     agent.run()
 
 
