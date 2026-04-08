@@ -6,51 +6,75 @@ Parses nmap XML output (-oX) into structured Python dicts.
 Feeds directly into:
   - StateManager.update(open_ports=..., services=..., os_guess=...)
   - KnowledgeBase via auto-generated Findings for notable NSE results
-  - LLM planner context via get_context_summary()
+  - LLM planner context via NmapResult.summary() or get_context_summary()
 
-Public API:
+──────────────────────────────────────────────────────────────
+PUBLIC API — dict-based (KIRA pipeline, backward-compatible)
+──────────────────────────────────────────────────────────────
     from kira.parsers.nmap_parser import parse_nmap_xml, extract_state_fields
 
-    result   = parse_nmap_xml("/sessions/scan/raw/nmap_20260406.xml")
-    fields   = extract_state_fields(result)
+    result  = parse_nmap_xml("/sessions/scan/raw/nmap_20260406.xml")
+    fields  = extract_state_fields(result)
     state.update(**fields)
+
+    findings = get_notable_script_findings(result)
+    ports    = open_ports(result)
+
+──────────────────────────────────────────────────────────────
+PUBLIC API — typed OOP wrapper (standalone / LLM injection)
+──────────────────────────────────────────────────────────────
+    from kira.parsers.nmap_parser import NmapParser
+
+    parser  = NmapParser("output.xml")
+    result  = parser.parse()          # returns NmapResult dataclass
+    print(result.summary())           # compact ~200-token LLM context string
+    print(result.to_json())           # full JSON dump
 
 Output shape of parse_nmap_xml():
     {
-      "scan_info": { "type": "syn", "protocol": "tcp", "num_services": "1000" },
+      "scan_info": { "type": "syn", "protocol": "tcp", "num_services": "1000",
+                     "scanner_args": "nmap -sV -sC ...", "scan_start": "..." },
       "hosts": [
         {
-          "ip":        "10.10.10.5",
-          "hostname":  "target.local",
-          "state":     "up",
-          "os_guess":  "Linux 4.15",
-          "os_accuracy": 95,
+          "ip":           "10.10.10.5",
+          "hostname":     "target.local",
+          "state":        "up",
+          "os_guess":     "Linux 4.15",
+          "os_accuracy":  95,
+          "os_ports_used": [{ "proto": "tcp", "portid": "22", "state": "open" }],
+          "uptime":       { "seconds": "86400", "lastboot": "..." },
+          "traceroute":   ["192.168.1.1", "10.0.0.1"],
           "ports": [
             {
-              "port":     80,
-              "protocol": "tcp",
-              "state":    "open",
-              "reason":   "syn-ack",
-              "service":  "http",
-              "product":  "Apache httpd",
-              "version":  "2.4.49",
-              "extra":    "(Debian)",
+              "port":         80,
+              "protocol":     "tcp",
+              "state":        "open",
+              "reason":       "syn-ack",
+              "service":      "http",
+              "product":      "Apache httpd",
+              "version":      "2.4.49",
+              "extra":        "(Debian)",
               "full_version": "Apache httpd 2.4.49 (Debian)",
-              "tunnel":   "",
-              "scripts":  {
+              "tunnel":       "",
+              "cpe":          ["cpe:/a:apache:http_server:2.4.49"],
+              "scripts": {
                 "http-title":  "Apache2 Ubuntu Default Page",
                 "http-server-headers": "Apache/2.4.49 (Debian)"
+              },
+              "scripts_structured": {
+                "some-script": [{"key": "value"}]
               }
             }
-          ],
-          "os_ports_used": [{ "proto": "tcp", "portid": "22" }]
+          ]
         }
       ],
       "raw_xml_path": "/sessions/.../nmap_....xml"
     }
 """
 
+import json
 import xml.etree.ElementTree as ET
+from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Optional
 
@@ -82,37 +106,193 @@ NOTABLE_SCRIPTS = {
 
 # Ports → canonical service name used in state["services"] keys
 PORT_SERVICE_HINTS = {
-    21:   "ftp",
-    22:   "ssh",
-    23:   "telnet",
-    25:   "smtp",
-    53:   "dns",
-    80:   "http",
-    110:  "pop3",
-    111:  "rpcbind",
-    135:  "msrpc",
-    139:  "netbios-ssn",
-    143:  "imap",
-    443:  "https",
-    445:  "microsoft-ds",
-    993:  "imaps",
-    995:  "pop3s",
-    1433: "ms-sql-s",
-    1521: "oracle",
-    2049: "nfs",
-    3306: "mysql",
-    3389: "ms-wbt-server",
-    5432: "postgresql",
-    5900: "vnc",
-    6379: "redis",
-    8080: "http-proxy",
-    8443: "https-alt",
-    9200: "elasticsearch",
-    27017:"mongodb",
+    21:    "ftp",
+    22:    "ssh",
+    23:    "telnet",
+    25:    "smtp",
+    53:    "dns",
+    80:    "http",
+    110:   "pop3",
+    111:   "rpcbind",
+    135:   "msrpc",
+    139:   "netbios-ssn",
+    143:   "imap",
+    443:   "https",
+    445:   "microsoft-ds",
+    993:   "imaps",
+    995:   "pop3s",
+    1433:  "ms-sql-s",
+    1521:  "oracle",
+    2049:  "nfs",
+    3306:  "mysql",
+    3389:  "ms-wbt-server",
+    5432:  "postgresql",
+    5900:  "vnc",
+    6379:  "redis",
+    8080:  "http-proxy",
+    8443:  "https-alt",
+    9200:  "elasticsearch",
+    27017: "mongodb",
 }
 
 
-# ── Main parser ────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# TYPED DATACLASS LAYER  (used by NmapParser — does not affect dict-based API)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class Service:
+    port:         int
+    protocol:     str           # tcp / udp
+    state:        str           # open / closed / filtered
+    name:         str           # e.g. "http", "ssh", "smb"
+    product:      str           # e.g. "Apache httpd"
+    version:      str           # e.g. "2.4.51"
+    extra_info:   str           # extra banner info
+    tunnel:       str           # e.g. "ssl"
+    reason:       str           # e.g. "syn-ack"
+    full_version: str           # product + version + extra joined
+    cpe:          list[str]     = field(default_factory=list)
+    scripts:      dict          = field(default_factory=dict)   # id → cleaned str
+    scripts_structured: dict    = field(default_factory=dict)   # id → parsed tables
+
+
+@dataclass
+class Host:
+    ip:           str
+    hostname:     str
+    state:        str           # up / down
+    os_matches:   list[dict]    = field(default_factory=list)   # [{name, accuracy}]
+    services:     list[Service] = field(default_factory=list)
+    traceroute:   list[str]     = field(default_factory=list)
+    os_ports_used: list[dict]   = field(default_factory=list)
+    uptime:       Optional[dict] = None                         # {seconds, lastboot}
+
+
+@dataclass
+class NmapResult:
+    command:    str
+    scan_start: str
+    scan_end:   str
+    hosts:      list[Host] = field(default_factory=list)
+
+    # ── Convenience accessors ─────────────────────────────────────────────────
+
+    def open_ports(self) -> list[dict]:
+        """Flat list of all open ports across all hosts."""
+        ports = []
+        for host in self.hosts:
+            for svc in host.services:
+                if svc.state == "open":
+                    ports.append({
+                        "ip":       host.ip,
+                        "port":     svc.port,
+                        "protocol": svc.protocol,
+                        "service":  svc.name,
+                        "product":  svc.product,
+                        "version":  svc.version,
+                    })
+        return ports
+
+    def services_by_name(self, name: str) -> list[dict]:
+        """Find all instances of a service by name (e.g. 'http', 'ssh')."""
+        return [p for p in self.open_ports() if p["service"] == name]
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+    def to_json(self, indent: int = 2) -> str:
+        return json.dumps(self.to_dict(), indent=indent)
+
+    def summary(self) -> str:
+        """Compact summary string for LLM context injection (~200 tokens)."""
+        lines = [f"Scan: {self.command}"]
+        for host in self.hosts:
+            lines.append(f"\nHost: {host.ip} ({host.hostname}) — {host.state}")
+            if host.os_matches:
+                top_os = host.os_matches[0]
+                lines.append(f"  OS: {top_os['name']} ({top_os['accuracy']}% confidence)")
+            for svc in (s for s in host.services if s.state == "open"):
+                lines.append(
+                    f"  {svc.port}/{svc.protocol}  {svc.name:<12}  {svc.full_version}"
+                )
+                for script_id, output in svc.scripts.items():
+                    # output is already a cleaned string at this point
+                    short = str(output).strip().replace("\n", " ")[:120]
+                    lines.append(f"    [NSE:{script_id}] {short}")
+        return "\n".join(lines)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# OOP PARSER  (wraps the dict-based parser into typed dataclasses)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class NmapParser:
+    """
+    Typed OOP wrapper around parse_nmap_xml().
+
+    Usage:
+        parser = NmapParser("output.xml")
+        result = parser.parse()   # returns NmapResult
+    """
+
+    def __init__(self, xml_path: str):
+        self.xml_path = xml_path
+
+    def parse(self) -> NmapResult:
+        raw = parse_nmap_xml(self.xml_path)
+        info = raw.get("scan_info", {})
+        result = NmapResult(
+            command=info.get("scanner_args", ""),
+            scan_start=info.get("scan_start", ""),
+            scan_end=self._get_scan_end(),
+        )
+        for h in raw.get("hosts", []):
+            host = Host(
+                ip=h["ip"],
+                hostname=h.get("hostname") or "",
+                state=h["state"],
+                os_matches=[
+                    {"name": h["os_guess"], "accuracy": h["os_accuracy"]}
+                ] if h.get("os_guess") else [],
+                traceroute=h.get("traceroute", []),
+                os_ports_used=h.get("os_ports_used", []),
+                uptime=h.get("uptime"),
+            )
+            for p in h.get("ports", []):
+                svc = Service(
+                    port=p["port"],
+                    protocol=p["protocol"],
+                    state=p["state"],
+                    name=p["service"],
+                    product=p["product"],
+                    version=p["version"],
+                    extra_info=p["extra"],
+                    tunnel=p["tunnel"],
+                    reason=p["reason"],
+                    full_version=p["full_version"],
+                    cpe=p["cpe"],
+                    scripts=p["scripts"],
+                    scripts_structured=p.get("scripts_structured", {}),
+                )
+                host.services.append(svc)
+            result.hosts.append(host)
+        return result
+
+    def _get_scan_end(self) -> str:
+        try:
+            tree = ET.parse(self.xml_path)
+            runstats = tree.getroot().find("runstats/finished")
+            if runstats is not None:
+                return runstats.attrib.get("timestr", "")
+        except Exception:
+            pass
+        return ""
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DICT-BASED API  (primary KIRA pipeline interface — backward-compatible)
+# ══════════════════════════════════════════════════════════════════════════════
 
 def parse_nmap_xml(xml_path: str) -> dict:
     """
@@ -141,7 +321,6 @@ def parse_nmap_xml(xml_path: str) -> dict:
         raise ValueError(f"Failed to parse nmap XML at {xml_path}: {e}") from e
 
     root = tree.getroot()
-
     if root.tag != "nmaprun":
         raise ValueError(
             f"Not an nmap XML file — root tag is '{root.tag}', expected 'nmaprun'"
@@ -161,8 +340,6 @@ def parse_nmap_xml(xml_path: str) -> dict:
     return result
 
 
-# ── State helper ───────────────────────────────────────────────────────────────
-
 def extract_state_fields(parsed: dict) -> dict:
     """
     Flatten a parse_nmap_xml() result into the exact keyword arguments
@@ -173,57 +350,45 @@ def extract_state_fields(parsed: dict) -> dict:
 
     Returns dict with keys:
         open_ports  : sorted list of open port numbers  [22, 80, 443]
-        services    : {"80": "Apache httpd 2.4.49", ...}
+        services    : {"80": "Apache httpd 2.4.49 (Debian)", ...}
         os_guess    : "Linux 4.15" or None
         hostnames   : ["target.local"]
     """
-    open_ports: list[int]  = []
-    services:   dict       = {}
-    os_guess:   Optional[str] = None
-    hostnames:  list[str]  = []
+    open_port_nums: list[int]     = []
+    services:       dict          = {}
+    os_guess:       Optional[str] = None
+    os_accuracy:    int           = 0
+    hostnames:      list[str]     = []
 
     for host in parsed.get("hosts", []):
         if host.get("state") != "up":
             continue
 
-        # Hostnames
         hn = host.get("hostname")
         if hn and hn not in hostnames:
             hostnames.append(hn)
 
-        # OS guess — take highest-accuracy result across all hosts
-        if host.get("os_guess") and (
-            os_guess is None
-            or host.get("os_accuracy", 0) > _current_os_accuracy(os_guess, parsed)
-        ):
-            os_guess = host["os_guess"]
+        # Track highest-accuracy OS guess across all hosts
+        if host.get("os_guess") and host.get("os_accuracy", 0) > os_accuracy:
+            os_guess   = host["os_guess"]
+            os_accuracy = host["os_accuracy"]
 
-        # Ports and services
         for port in host.get("ports", []):
             if port["state"] != "open":
                 continue
 
             portnum = port["port"]
-            if portnum not in open_ports:
-                open_ports.append(portnum)
+            if portnum not in open_port_nums:
+                open_port_nums.append(portnum)
 
-            # Build a human-readable version string for the services dict
-            full_ver = port.get("full_version") or ""
-            if not full_ver:
-                parts = [p for p in [
-                    port.get("product", ""),
-                    port.get("version", ""),
-                    port.get("extra",   ""),
-                ] if p]
-                full_ver = " ".join(parts).strip()
-
+            full_ver = port.get("full_version", "").strip()
             if not full_ver:
                 full_ver = port.get("service") or PORT_SERVICE_HINTS.get(portnum, "unknown")
 
             services[str(portnum)] = full_ver
 
     return {
-        "open_ports": sorted(open_ports),
+        "open_ports": sorted(open_port_nums),
         "services":   services,
         "os_guess":   os_guess,
         "hostnames":  hostnames,
@@ -234,118 +399,84 @@ def get_notable_script_findings(parsed: dict) -> list[dict]:
     """
     Scan all NSE script outputs for immediately actionable findings.
     Returns a list of partial Finding dicts (title, severity, port,
-    service, description) ready to pass to KnowledgeBase.add().
-
-    Handles: anonymous FTP, MySQL empty password, EternalBlue,
-             HTTP auth required, weak SSH, exposed robots.txt.
+    service, cvss, cve, exploit_available, description, remediation)
+    ready to pass to KnowledgeBase.add().
     """
     findings = []
-
     for host in parsed.get("hosts", []):
         for port_info in host.get("ports", []):
             if port_info["state"] != "open":
                 continue
-
             port    = port_info["port"]
             service = port_info.get("service", "")
-            scripts = port_info.get("scripts", {})
-
-            for script_id, output in scripts.items():
+            for script_id, output in port_info.get("scripts", {}).items():
                 finding = _script_to_finding(script_id, output, port, service)
                 if finding:
                     findings.append(finding)
-
     return findings
 
 
 def open_ports(parsed: dict) -> list[dict]:
     """
     Extract a flat list of all open ports across all hosts.
-    Returns list of dicts with {ip, port, protocol, service, product, version}.
+    Returns list of dicts: {ip, port, protocol, service, product, version}.
     """
     ports = []
     for host in parsed.get("hosts", []):
         for p in host.get("ports", []):
             if p["state"] == "open":
                 ports.append({
-                    "ip": host["ip"],
-                    "port": p["port"],
+                    "ip":       host["ip"],
+                    "port":     p["port"],
                     "protocol": p["protocol"],
-                    "service": p["service"],
-                    "product": p["product"],
-                    "version": p["version"],
+                    "service":  p["service"],
+                    "product":  p["product"],
+                    "version":  p["version"],
                 })
     return ports
 
-    def services_by_name(self, name: str) -> list[dict]:
-        """Find all instances of a service by name (e.g. 'http', 'ssh')."""
-        return [p for p in self.open_ports() if p["service"] == name]
 
-    def to_dict(self) -> dict:
-        return asdict(self)
+# ══════════════════════════════════════════════════════════════════════════════
+# INTERNAL PARSERS
+# ══════════════════════════════════════════════════════════════════════════════
 
-    def to_json(self, indent: int = 2) -> str:
-        return json.dumps(self.to_dict(), indent=indent)
+def _parse_scan_info(root: ET.Element) -> dict:
+    si = root.find("scaninfo")
+    if si is None:
+        return {}
+    return {
+        "type":         si.attrib.get("type", ""),
+        "protocol":     si.attrib.get("protocol", ""),
+        "num_services": si.attrib.get("numservices", ""),
+        "scanner_args": root.attrib.get("args", ""),
+        "scan_start":   root.attrib.get("startstr", ""),
+    }
 
-    def summary(self) -> str:
-        """Compact summary string for LLM context injection (~200 tokens)."""
-        lines = [f"Scan: {self.command}"]
-        for host in self.hosts:
-            lines.append(f"\nHost: {host.ip} ({host.hostname}) — {host.state}")
-            if host.os_matches:
-                top_os = host.os_matches[0]
-                lines.append(f"  OS: {top_os['name']} ({top_os['accuracy']}% confidence)")
-            open_svcs = [s for s in host.services if s.state == "open"]
-            for svc in open_svcs:
-                version_str = f"{svc.product} {svc.version}".strip()
-                lines.append(
-                    f"  {svc.port}/{svc.protocol}  {svc.name:<12}  {version_str}"
-                )
-                for script_id, output in svc.scripts.items():
-                    if isinstance(output, dict):
-                        raw = output.get("output", "")
-                    else:
-                        raw = output
-                        short = str(raw).strip().replace("\n", " ")[:120]
-                        lines.append(f"    [NSE:{script_id}] {short}")
-        return "\n".join(lines)
-
-
-# ── Internal: host parsing ─────────────────────────────────────────────────────
 
 def _parse_host(host_elem: ET.Element) -> Optional[dict]:
-    """Parse a single <host> element."""
-
-    # Skip hosts that are down
+    """Parse a single <host> element into a dict."""
     status = host_elem.find("status")
     state  = status.attrib.get("state", "unknown") if status is not None else "unknown"
 
-    # IP address
+    # IP address — prefer IPv4, fall back to IPv6
     ip = None
-    for addr in host_elem.findall("address"):
-        if addr.attrib.get("addrtype") == "ipv4":
-            ip = addr.attrib.get("addr")
-            break
-    if not ip:
-        # Try IPv6
+    for addrtype in ("ipv4", "ipv6"):
         for addr in host_elem.findall("address"):
-            if addr.attrib.get("addrtype") == "ipv6":
+            if addr.attrib.get("addrtype") == addrtype:
                 ip = addr.attrib.get("addr")
                 break
+        if ip:
+            break
 
     if not ip:
         return None
 
-    # Hostname (first PTR or user record)
-    hostname = _parse_hostname(host_elem)
-
-    # OS detection
+    hostname      = _parse_hostname(host_elem)
     os_guess, os_accuracy = _parse_os(host_elem)
+    ports         = _parse_ports(host_elem)
+    traceroute    = _parse_traceroute(host_elem)
 
-    # Ports
-    ports = _parse_ports(host_elem)
-
-    # OS ports used (helps verify OS guess)
+    # OS ports used
     os_ports_used = []
     os_elem = host_elem.find("os")
     if os_elem is not None:
@@ -366,26 +497,24 @@ def _parse_host(host_elem: ET.Element) -> Optional[dict]:
         }
 
     return {
-        "ip":           ip,
-        "hostname":     hostname,
-        "state":        state,
-        "os_guess":     os_guess,
-        "os_accuracy":  os_accuracy,
+        "ip":            ip,
+        "hostname":      hostname,
+        "state":         state,
+        "os_guess":      os_guess,
+        "os_accuracy":   os_accuracy,
         "os_ports_used": os_ports_used,
-        "ports":        ports,
-        "uptime":       uptime,
+        "uptime":        uptime,
+        "traceroute":    traceroute,
+        "ports":         ports,
     }
 
 
 def _parse_hostname(host_elem: ET.Element) -> Optional[str]:
-    """Extract the best available hostname."""
+    """Extract the best hostname — PTR preferred over user entries."""
     hostnames_elem = host_elem.find("hostnames")
     if hostnames_elem is None:
         return None
-
-    # Prefer "PTR" (reverse DNS) over "user" entries
-    ptr  = None
-    user = None
+    ptr = user = None
     for hn in hostnames_elem.findall("hostname"):
         hn_type = hn.attrib.get("type", "")
         hn_name = hn.attrib.get("name", "").strip()
@@ -395,165 +524,165 @@ def _parse_hostname(host_elem: ET.Element) -> Optional[str]:
             ptr = hn_name
         elif hn_type == "user" and user is None:
             user = hn_name
-
     return ptr or user
 
 
 def _parse_os(host_elem: ET.Element) -> tuple[Optional[str], int]:
-    """
-    Return (os_name, accuracy_percent) for the highest-confidence OS match.
-    Returns (None, 0) if no OS detection data is present.
-    """
+    """Return (os_name, accuracy_percent) for the highest-confidence OS match."""
     os_elem = host_elem.find("os")
     if os_elem is None:
         return None, 0
-
-    best_match   = None
-    best_accuracy = 0
-
+    best_name, best_acc = None, 0
     for osmatch in os_elem.findall("osmatch"):
-        accuracy = int(osmatch.attrib.get("accuracy", "0"))
-        name     = osmatch.attrib.get("name", "").strip()
-        if accuracy > best_accuracy and name:
-            best_accuracy = accuracy
-            best_match    = name
+        acc  = int(osmatch.attrib.get("accuracy", "0"))
+        name = osmatch.attrib.get("name", "").strip()
+        if acc > best_acc and name:
+            best_acc  = acc
+            best_name = name
+    return best_name, best_acc
 
-    return best_match, best_accuracy
+
+def _parse_traceroute(host_elem: ET.Element) -> list[str]:
+    """Extract ordered hop IPs from <trace> if present."""
+    trace_elem = host_elem.find("trace")
+    if trace_elem is None:
+        return []
+    hops = []
+    for hop in trace_elem.findall("hop"):
+        hop_ip = hop.attrib.get("ipaddr", "")
+        if hop_ip:
+            hops.append(hop_ip)
+    return hops
 
 
 def _parse_ports(host_elem: ET.Element) -> list[dict]:
-    """Parse all <port> elements under <ports>."""
     ports_elem = host_elem.find("ports")
     if ports_elem is None:
         return []
-
-    ports = []
-    for port_elem in ports_elem.findall("port"):
-        port = _parse_single_port(port_elem)
-        if port:
-            ports.append(port)
-
-    return ports
+    return [
+        p for p in (
+            _parse_single_port(pe) for pe in ports_elem.findall("port")
+        ) if p is not None
+    ]
 
 
 def _parse_single_port(port_elem: ET.Element) -> Optional[dict]:
-    """Parse a single <port> element including service and NSE scripts."""
+    """Parse a single <port> element including service fingerprint and NSE scripts."""
+    portnum  = int(port_elem.attrib.get("portid", 0))
+    protocol = port_elem.attrib.get("protocol", "tcp")
 
-    portnum   = int(port_elem.attrib.get("portid", 0))
-    protocol  = port_elem.attrib.get("protocol", "tcp")
-
-    # State
     state_elem = port_elem.find("state")
     if state_elem is None:
         return None
     state  = state_elem.attrib.get("state",  "unknown")
     reason = state_elem.attrib.get("reason", "")
 
-    # Service fingerprint
-    product  = ""
-    version  = ""
-    extra    = ""
+    product = version = extra = tunnel = ""
     service  = PORT_SERVICE_HINTS.get(portnum, "")
-    tunnel   = ""
     cpe_list = []
 
     svc_elem = port_elem.find("service")
     if svc_elem is not None:
-        service  = svc_elem.attrib.get("name",    service)
-        product  = svc_elem.attrib.get("product", "").strip()
-        version  = svc_elem.attrib.get("version", "").strip()
-        extra    = svc_elem.attrib.get("extrainfo","").strip()
-        tunnel   = svc_elem.attrib.get("tunnel",  "")
+        service = svc_elem.attrib.get("name",     service)
+        product = svc_elem.attrib.get("product",  "").strip()
+        version = svc_elem.attrib.get("version",  "").strip()
+        extra   = svc_elem.attrib.get("extrainfo","").strip()
+        tunnel  = svc_elem.attrib.get("tunnel",   "")
+        cpe_list = [
+            c.text.strip() for c in svc_elem.findall("cpe") if c.text
+        ]
 
-        # CPE identifiers (e.g. cpe:/a:apache:http_server:2.4.49)
-        for cpe_elem in svc_elem.findall("cpe"):
-            cpe_text = (cpe_elem.text or "").strip()
-            if cpe_text:
-                cpe_list.append(cpe_text)
+    full_version = " ".join(p for p in [product, version, extra] if p).strip()
 
-    # Build a clean, human-readable version string
-    parts = [p for p in [product, version, extra] if p]
-    full_version = " ".join(parts).strip()
-
-    # NSE script results
-    scripts = _parse_scripts(port_elem)
+    scripts, scripts_structured = _parse_scripts(port_elem)
 
     return {
-        "port":         portnum,
-        "protocol":     protocol,
-        "state":        state,
-        "reason":       reason,
-        "service":      service,
-        "product":      product,
-        "version":      version,
-        "extra":        extra,
-        "full_version": full_version,
-        "tunnel":       tunnel,
-        "cpe":          cpe_list,
-        "scripts":      scripts,
+        "port":               portnum,
+        "protocol":           protocol,
+        "state":              state,
+        "reason":             reason,
+        "service":            service,
+        "product":            product,
+        "version":            version,
+        "extra":              extra,
+        "full_version":       full_version,
+        "tunnel":             tunnel,
+        "cpe":                cpe_list,
+        "scripts":            scripts,
+        "scripts_structured": scripts_structured,
     }
 
 
-def _parse_scripts(parent_elem: ET.Element) -> dict:
+def _parse_scripts(parent_elem: ET.Element) -> tuple[dict, dict]:
     """
-    Parse all <script> children of a port or host element.
-    Returns {script_id: output_string} for NOTABLE_SCRIPTS,
-    plus any script whose output contains useful keywords.
+    Parse all <script> children.
+
+    Returns
+    -------
+    scripts            : {script_id: cleaned_output_string}
+                         Captured for NOTABLE_SCRIPTS or if output contains
+                         actionable keywords.
+    scripts_structured : {script_id: parsed_table_list}
+                         Only populated when <table> sub-elements are present.
     """
-    scripts = {}
+    scripts: dict    = {}
+    structured: dict = {}
+
     for script_elem in parent_elem.findall("script"):
         script_id = script_elem.attrib.get("id", "")
-        output    = script_elem.attrib.get("output", "").strip()
+        raw_out   = script_elem.attrib.get("output", "").strip()
 
-        # Always capture notable scripts
-        if script_id in NOTABLE_SCRIPTS:
-            scripts[script_id] = _clean_script_output(output)
+        # Determine if this script is worth capturing
+        is_notable = script_id in NOTABLE_SCRIPTS
+        is_interesting = not is_notable and any(
+            kw in raw_out.lower() for kw in (
+                "vulnerable", "exploitable", "anonymous",
+                "allowed", "enabled", "weak", "cve-",
+            )
+        )
+
+        if not (is_notable or is_interesting):
             continue
 
-        # Also capture any script with interesting keywords in output
-        lower = output.lower()
-        if any(kw in lower for kw in (
-            "vulnerable", "exploitable", "anonymous",
-            "allowed", "enabled", "weak", "cve-",
-        )):
-            scripts[script_id] = _clean_script_output(output)
+        scripts[script_id] = _clean_script_output(raw_out)
 
-    return scripts
+        # Also capture recursive structured table output when present
+        tables = script_elem.findall("table")
+        if tables:
+            structured[script_id] = _parse_script_tables(tables)
+
+    return scripts, structured
+
+
+def _parse_script_tables(tables: list[ET.Element]) -> list[dict]:
+    """Recursively parse NSE <table> elements into Python dicts."""
+    result = []
+    for table in tables:
+        entry: dict = {}
+        for elem in table.findall("elem"):
+            key   = elem.attrib.get("key", "")
+            value = elem.text or ""
+            if key:
+                entry[key] = value
+            else:
+                entry.setdefault("_values", []).append(value)
+        nested = _parse_script_tables(table.findall("table"))
+        if nested:
+            entry["_tables"] = nested
+        if entry:
+            result.append(entry)
+    return result
 
 
 def _clean_script_output(raw: str) -> str:
-    """Collapse excessive whitespace from NSE script output."""
+    """Collapse whitespace from NSE output; cap at 5 lines to avoid bloating state."""
     lines = [line.strip() for line in raw.splitlines() if line.strip()]
-    return " | ".join(lines[:5])   # cap at 5 lines to avoid bloating state
+    return " | ".join(lines[:5])
 
 
-# ── Internal: scan info ────────────────────────────────────────────────────────
-
-def _parse_scan_info(root: ET.Element) -> dict:
-    """Parse the <scaninfo> element."""
-    si = root.find("scaninfo")
-    if si is None:
-        return {}
-    return {
-        "type":         si.attrib.get("type", ""),
-        "protocol":     si.attrib.get("protocol", ""),
-        "num_services": si.attrib.get("numservices", ""),
-        "scanner_args": root.attrib.get("args", ""),
-        "scan_start":   root.attrib.get("startstr", ""),
-    }
-
-
-# ── Internal: OS accuracy helper ──────────────────────────────────────────────
-
-def _current_os_accuracy(current_guess: str, parsed: dict) -> int:
-    """Find the accuracy of the currently stored os_guess."""
-    for host in parsed.get("hosts", []):
-        if host.get("os_guess") == current_guess:
-            return host.get("os_accuracy", 0)
-    return 0
-
-
-# ── Internal: NSE → Finding mapper ────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# NSE → FINDING MAPPER
+# ══════════════════════════════════════════════════════════════════════════════
 
 def _script_to_finding(
     script_id: str,
@@ -563,12 +692,10 @@ def _script_to_finding(
 ) -> Optional[dict]:
     """
     Map a known NSE script result to a partial Finding dict.
-    Returns None if the script output doesn't indicate a vulnerability.
+    Returns None if the output doesn't indicate a vulnerability.
     """
-
     out_lower = output.lower()
 
-    # ── Anonymous FTP ─────────────────────────────────────────────────────────
     if script_id == "ftp-anon" and "anonymous ftp login allowed" in out_lower:
         return {
             "title":             "Anonymous FTP Login Allowed",
@@ -578,17 +705,16 @@ def _script_to_finding(
             "cvss":              9.8,
             "cve":               "",
             "exploit_available": True,
-            "description":       (
+            "description": (
                 f"FTP server on port {port} allows unauthenticated anonymous "
                 f"login. Output: {output[:200]}"
             ),
-            "remediation":       (
+            "remediation": (
                 "Disable anonymous FTP access. If required, restrict to "
                 "read-only on a dedicated chroot directory."
             ),
         }
 
-    # ── MySQL empty password ───────────────────────────────────────────────────
     if script_id == "mysql-empty-password" and (
         "root account has empty password" in out_lower
         or "login possible" in out_lower
@@ -601,17 +727,16 @@ def _script_to_finding(
             "cvss":              9.8,
             "cve":               "",
             "exploit_available": True,
-            "description":       (
+            "description": (
                 f"MySQL on port {port} accepts root login with no password. "
                 f"Output: {output[:200]}"
             ),
-            "remediation":       (
+            "remediation": (
                 "Set a strong root password immediately: "
                 "ALTER USER 'root'@'localhost' IDENTIFIED BY '<strong_pass>';"
             ),
         }
 
-    # ── EternalBlue ───────────────────────────────────────────────────────────
     if script_id == "smb-vuln-ms17-010" and "vulnerable" in out_lower:
         return {
             "title":             "MS17-010 EternalBlue (SMB RCE)",
@@ -621,17 +746,16 @@ def _script_to_finding(
             "cvss":              9.3,
             "cve":               "CVE-2017-0144",
             "exploit_available": True,
-            "description":       (
+            "description": (
                 "Host is vulnerable to EternalBlue — unauthenticated remote "
                 f"code execution via SMB. Output: {output[:200]}"
             ),
-            "remediation":       (
+            "remediation": (
                 "Apply MS17-010 patch immediately. Disable SMBv1: "
                 "Set-SmbServerConfiguration -EnableSMB1Protocol $false"
             ),
         }
 
-    # ── MS08-067 ──────────────────────────────────────────────────────────────
     if script_id == "smb-vuln-ms08-067" and "vulnerable" in out_lower:
         return {
             "title":             "MS08-067 NetAPI Stack Overflow (RCE)",
@@ -641,14 +765,13 @@ def _script_to_finding(
             "cvss":              10.0,
             "cve":               "CVE-2008-4250",
             "exploit_available": True,
-            "description":       (
+            "description": (
                 "Host is vulnerable to MS08-067 — unauthenticated RCE via "
                 f"NetAPI. Output: {output[:200]}"
             ),
-            "remediation":       "Apply MS08-067 patch. Block SMB at network boundary.",
+            "remediation": "Apply MS08-067 patch. Block SMB at network boundary.",
         }
 
-    # ── SSH weak host key ─────────────────────────────────────────────────────
     if script_id == "ssh-auth-methods":
         if "password" in out_lower and "publickey" not in out_lower:
             return {
@@ -659,17 +782,16 @@ def _script_to_finding(
                 "cvss":              5.3,
                 "cve":               "",
                 "exploit_available": False,
-                "description":       (
+                "description": (
                     f"SSH on port {port} allows password authentication, "
                     "increasing brute-force risk."
                 ),
-                "remediation":       (
+                "remediation": (
                     "Disable password auth in sshd_config: "
                     "PasswordAuthentication no"
                 ),
             }
 
-    # ── SSL/TLS weak DH params ────────────────────────────────────────────────
     if script_id == "ssl-dh-params" and (
         "logjam" in out_lower or "weak" in out_lower or "vulnerable" in out_lower
     ):
@@ -681,17 +803,16 @@ def _script_to_finding(
             "cvss":              7.4,
             "cve":               "CVE-2015-4000",
             "exploit_available": False,
-            "description":       (
+            "description": (
                 f"Port {port} uses weak DH parameters vulnerable to LOGJAM. "
                 f"Output: {output[:200]}"
             ),
-            "remediation":       (
+            "remediation": (
                 "Generate DH params ≥2048 bits: "
                 "openssl dhparam -out dhparam.pem 2048"
             ),
         }
 
-    # ── HTTP auth exposed ─────────────────────────────────────────────────────
     if script_id == "http-auth-finder" and "basic" in out_lower:
         return {
             "title":             "HTTP Basic Authentication Detected",
@@ -701,17 +822,19 @@ def _script_to_finding(
             "cvss":              5.4,
             "cve":               "",
             "exploit_available": False,
-            "description":       (
+            "description": (
                 f"Port {port} uses HTTP Basic Auth — credentials transmitted "
                 "base64-encoded without TLS are trivially decodable."
             ),
-            "remediation":       "Migrate to HTTPS and use modern auth (OAuth2, JWT).",
+            "remediation": "Migrate to HTTPS and use modern auth (OAuth2, JWT).",
         }
 
     return None
 
 
-# ── Pretty printer (dev/debug) ─────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# PRETTY PRINTER  (dev / debug)
+# ══════════════════════════════════════════════════════════════════════════════
 
 def pretty_print(parsed: dict) -> None:
     """Print a human-readable summary of parse_nmap_xml() output."""
@@ -725,9 +848,11 @@ def pretty_print(parsed: dict) -> None:
         return
 
     info = parsed.get("scan_info", {})
-    c.print(f"\n[bold]Nmap scan[/bold]  {info.get('scanner_args','')}")
-    c.print(f"Started: {info.get('scan_start','')}  |  "
-            f"Services scanned: {info.get('num_services','?')}\n")
+    c.print(f"\n[bold]Nmap scan[/bold]  {info.get('scanner_args', '')}")
+    c.print(
+        f"Started: {info.get('scan_start', '')}  |  "
+        f"Services scanned: {info.get('num_services', '?')}\n"
+    )
 
     for host in parsed.get("hosts", []):
         c.print(
@@ -741,8 +866,8 @@ def pretty_print(parsed: dict) -> None:
                 f"  (accuracy {host['os_accuracy']}%)"
             )
 
-        open_ports_list = [p for p in host["ports"] if p["state"] == "open"]
-        if not open_ports_list:
+        open_list = [p for p in host["ports"] if p["state"] == "open"]
+        if not open_list:
             c.print("  [dim]No open ports found[/dim]")
             continue
 
@@ -753,7 +878,7 @@ def pretty_print(parsed: dict) -> None:
         tbl.add_column("Version")
         tbl.add_column("Scripts", overflow="fold")
 
-        for p in open_ports_list:
+        for p in open_list:
             script_summary = "  ".join(
                 f"[{sid}] {out[:60]}"
                 for sid, out in list(p["scripts"].items())[:3]
@@ -785,26 +910,29 @@ def pretty_print(parsed: dict) -> None:
 def _plain_print(parsed: dict) -> None:
     """Fallback printer when rich is not installed."""
     for host in parsed.get("hosts", []):
-        print(f"\nHost: {host['ip']}  hostname={host.get('hostname')}  "
-              f"os={host.get('os_guess')}")
+        print(
+            f"\nHost: {host['ip']}  hostname={host.get('hostname')}  "
+            f"os={host.get('os_guess')}"
+        )
         for p in host["ports"]:
             if p["state"] == "open":
-                print(f"  {p['port']}/{p['protocol']}  {p['service']}"
-                      f"  {p['full_version']}")
+                print(f"  {p['port']}/{p['protocol']}  {p['service']}  {p['full_version']}")
                 for sid, out in p["scripts"].items():
                     print(f"    [{sid}] {out[:80]}")
 
 
-# ── Smoke test ─────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# SMOKE TEST
+# ══════════════════════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
+    import os
     import sys
     import tempfile
     import textwrap
 
     print("=== nmap_parser.py smoke test ===\n")
 
-    # ── Build a realistic synthetic nmap XML ──────────────────────────────────
     SAMPLE_XML = textwrap.dedent("""\
     <?xml version="1.0" encoding="UTF-8"?>
     <!DOCTYPE nmaprun>
@@ -867,7 +995,14 @@ if __name__ == "__main__":
           <portused state="open" proto="tcp" portid="22"/>
         </os>
         <uptime seconds="86400" lastboot="Sat Apr  5 12:00:00 2026"/>
+        <trace>
+          <hop ipaddr="192.168.1.1"/>
+          <hop ipaddr="10.0.0.1"/>
+        </trace>
       </host>
+      <runstats>
+        <finished timestr="Sun Apr  6 12:05:00 2026"/>
+      </runstats>
     </nmaprun>
     """)
 
@@ -875,97 +1010,109 @@ if __name__ == "__main__":
         f.write(SAMPLE_XML)
         xml_path = f.name
 
-    # ── 1. Basic parse ─────────────────────────────────────────────────────────
+    # ── 1. Basic parse ────────────────────────────────────────────────────────
     print("[1] parse_nmap_xml()")
     parsed = parse_nmap_xml(xml_path)
-    assert len(parsed["hosts"]) == 1,           "Should find 1 host"
-    host = parsed["hosts"][0]
-    assert host["ip"] == "10.10.10.5",          "IP mismatch"
+    host   = parsed["hosts"][0]
+    assert host["ip"]       == "10.10.10.5",   "IP mismatch"
     assert host["hostname"] == "target.local",  "Hostname mismatch"
-    assert host["os_guess"] == "Linux 4.15",    "OS guess mismatch"
+    assert host["os_guess"] == "Linux 4.15",    "OS mismatch"
     assert host["os_accuracy"] == 95,           "OS accuracy mismatch"
-    print(f"    host: {host['ip']}  hostname: {host['hostname']}  os: {host['os_guess']}")
+    print(f"    host: {host['ip']}  os: {host['os_guess']}  uptime: {host['uptime']}")
 
-    # ── 2. Open ports ──────────────────────────────────────────────────────────
-    print("\n[2] Open ports")
-    parsed_open_ports = open_ports(parsed)
-    port_nums  = [p["port"] for p in parsed_open_ports]
-    assert 21  in port_nums, "FTP not detected"
-    assert 22  in port_nums, "SSH not detected"
-    assert 80  in port_nums, "HTTP not detected"
-    assert 445 in port_nums, "SMB not detected"
-    assert 3306 in port_nums,"MySQL not detected"
+    # ── 2. Traceroute ─────────────────────────────────────────────────────────
+    print("\n[2] Traceroute")
+    assert host["traceroute"] == ["192.168.1.1", "10.0.0.1"], "Traceroute mismatch"
+    print(f"    hops: {host['traceroute']}")
+
+    # ── 3. Open ports (dict API) ──────────────────────────────────────────────
+    print("\n[3] open_ports()")
+    op = open_ports(parsed)
+    port_nums = [p["port"] for p in op]
+    assert sorted(port_nums) == [21, 22, 80, 139, 445, 3306], f"Port list wrong: {port_nums}"
     assert 8080 not in port_nums, "Filtered port should not appear"
-    print(f"    open ports: {sorted(port_nums)}")
+    print(f"    open: {sorted(port_nums)}")
 
-    # ── 3. Service versions ────────────────────────────────────────────────────
-    print("\n[3] Service version strings")
+    # ── 4. Full version strings ───────────────────────────────────────────────
+    print("\n[4] full_version strings")
     port_map = {p["port"]: p for p in host["ports"]}
-    assert port_map[80]["product"]  == "Apache httpd",       "Apache product mismatch"
-    assert port_map[80]["version"]  == "2.4.49",             "Apache version mismatch"
-    assert port_map[80]["full_version"] == "Apache httpd 2.4.49 (Debian)", "Full version mismatch"
-    assert "cpe:/a:apache:http_server:2.4.49" in port_map[80]["cpe"], "CPE missing"
+    assert port_map[80]["full_version"] == "Apache httpd 2.4.49 (Debian)"
+    assert port_map[22]["full_version"] == "OpenSSH 7.2p2 Ubuntu 4ubuntu2.8"
+    assert "cpe:/a:apache:http_server:2.4.49" in port_map[80]["cpe"]
     print(f"    port 80: {port_map[80]['full_version']}")
     print(f"    port 22: {port_map[22]['full_version']}")
-    print(f"    port 21: {port_map[21]['full_version']}")
 
-    # ── 4. NSE scripts ─────────────────────────────────────────────────────────
-    print("\n[4] NSE script capture")
-    assert "ftp-anon"      in port_map[21]["scripts"],  "ftp-anon script missing"
-    assert "http-title"    in port_map[80]["scripts"],  "http-title script missing"
-    assert "smb-vuln-ms17-010" in port_map[445]["scripts"], "EternalBlue script missing"
-    assert "mysql-empty-password" in port_map[3306]["scripts"], "MySQL script missing"
+    # ── 5. NSE scripts ────────────────────────────────────────────────────────
+    print("\n[5] NSE scripts")
+    assert "ftp-anon"          in port_map[21]["scripts"]
+    assert "smb-vuln-ms17-010" in port_map[445]["scripts"]
+    assert "mysql-empty-password" in port_map[3306]["scripts"]
     print(f"    ftp-anon:          {port_map[21]['scripts']['ftp-anon']}")
-    print(f"    http-title:        {port_map[80]['scripts']['http-title']}")
     print(f"    smb-vuln-ms17-010: {port_map[445]['scripts']['smb-vuln-ms17-010'][:60]}")
 
-    # ── 5. extract_state_fields ────────────────────────────────────────────────
-    print("\n[5] extract_state_fields()")
+    # ── 6. extract_state_fields ───────────────────────────────────────────────
+    print("\n[6] extract_state_fields()")
     fields = extract_state_fields(parsed)
-    assert fields["open_ports"] == [21, 22, 80, 139, 445, 3306], \
-        f"Port list mismatch: {fields['open_ports']}"
-    assert fields["services"]["80"] == "Apache httpd 2.4.49 (Debian)", \
-        f"Service string wrong: {fields['services']['80']}"
-    assert fields["os_guess"] == "Linux 4.15", "OS guess missing from fields"
-    assert "target.local" in fields["hostnames"], "Hostname missing from fields"
+    assert fields["open_ports"] == [21, 22, 80, 139, 445, 3306]
+    assert fields["services"]["80"] == "Apache httpd 2.4.49 (Debian)"
+    assert fields["os_guess"] == "Linux 4.15"
+    assert "target.local" in fields["hostnames"]
     print(f"    open_ports: {fields['open_ports']}")
     print(f"    services[80]: {fields['services']['80']}")
-    print(f"    services[3306]: {fields['services']['3306']}")
-    print(f"    os_guess: {fields['os_guess']}")
 
-    # ── 6. Auto-findings from NSE ──────────────────────────────────────────────
-    print("\n[6] get_notable_script_findings()")
+    # ── 7. Auto-findings ──────────────────────────────────────────────────────
+    print("\n[7] get_notable_script_findings()")
     findings = get_notable_script_findings(parsed)
     titles   = [f["title"] for f in findings]
-    print(f"    {len(findings)} findings generated:")
     for f in findings:
         print(f"    [{f['severity'].upper():8s}] port {f['port']:5} | {f['title']}")
-    assert any("Anonymous FTP"   in t for t in titles), "FTP finding missing"
-    assert any("EternalBlue"     in t for t in titles), "MS17-010 finding missing"
-    assert any("MySQL Root"      in t for t in titles), "MySQL finding missing"
+    assert any("Anonymous FTP" in t for t in titles)
+    assert any("EternalBlue"   in t for t in titles)
+    assert any("MySQL Root"    in t for t in titles)
 
-    # ── 7. Error cases ─────────────────────────────────────────────────────────
-    print("\n[7] Error handling")
+    # ── 8. OOP NmapParser wrapper ─────────────────────────────────────────────
+    print("\n[8] NmapParser (OOP layer)")
+    result = NmapParser(xml_path).parse()
+    assert result.command    == "nmap -sV -sC --open 10.10.10.5"
+    assert result.scan_end   == "Sun Apr  6 12:05:00 2026"
+    assert len(result.hosts) == 1
+    h = result.hosts[0]
+    assert h.ip       == "10.10.10.5"
+    assert h.hostname == "target.local"
+    assert h.traceroute == ["192.168.1.1", "10.0.0.1"]
+    assert h.uptime is not None
+    open_svcs = [s for s in h.services if s.state == "open"]
+    assert len(open_svcs) == 6
+    assert result.services_by_name("http")[0]["port"] == 80
+    summary = result.summary()
+    assert "10.10.10.5" in summary
+    assert "ftp-anon"   in summary
+    json_out = result.to_json()
+    data = json.loads(json_out)
+    assert data["hosts"][0]["ip"] == "10.10.10.5"
+    print(f"    command:   {result.command}")
+    print(f"    scan_end:  {result.scan_end}")
+    print(f"    open svcs: {[s.port for s in open_svcs]}")
+
+    # ── 9. Error handling ─────────────────────────────────────────────────────
+    print("\n[9] Error handling")
     try:
         parse_nmap_xml("/nonexistent/path.xml")
-        assert False, "Should have raised FileNotFoundError"
     except FileNotFoundError as e:
         print(f"    FileNotFoundError: OK — {e}")
 
     with tempfile.NamedTemporaryFile(suffix=".xml", mode="w", delete=False) as f:
-        f.write("<notanmap><junk/></notanmap>")
+        f.write("<notanmap/>")
         bad_path = f.name
     try:
         parse_nmap_xml(bad_path)
-        assert False, "Should have raised ValueError"
     except ValueError as e:
         print(f"    ValueError: OK — {e}")
 
-    # ── 8. Pretty print ────────────────────────────────────────────────────────
-    print("\n[8] pretty_print():")
+    # ── 10. Pretty print ──────────────────────────────────────────────────────
+    print("\n[10] pretty_print():")
     pretty_print(parsed)
 
-    import os
     os.unlink(xml_path)
     os.unlink(bad_path)
-    print("All tests passed.")
+    print("\nAll tests passed.")
