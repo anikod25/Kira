@@ -18,7 +18,7 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from kira.parsers.nmap_parser import NmapParser, NmapResult
+from kira.parsers.nmap_parser import parse_nmap_xml, open_ports, summary
 
 # ─────────────────────────────────────────────
 # Constants
@@ -407,24 +407,24 @@ class KiraAgent:
         xml_path = self.executor.nmap_scan(self.target)
         if not xml_path.exists():
             return "nmap scan failed — XML not found"
-        result = NmapParser(str(xml_path)).parse()
+        result = parse_nmap_xml(str(xml_path))
         self._ingest_nmap(result)
         self.state.state["scan_files"]["nmap_initial"] = str(xml_path)
         self.state.save()
-        return f"Found {len(result.open_ports())} open ports\n{result.summary()}"
+        return f"Found {len(open_ports(result))} open ports\n{summary(result)}"
 
     def _do_nmap_full(self) -> str:
         xml_path = self.executor.nmap_full(self.target)
         if not xml_path.exists():
             return "full nmap scan failed"
-        result = NmapParser(str(xml_path)).parse()
+        result = parse_nmap_xml(str(xml_path))
         self._ingest_nmap(result)
         self.state.state["scan_files"]["nmap_full"] = str(xml_path)
         self.state.save()
-        return f"Full scan: {len(result.open_ports())} open ports"
+        return f"Full scan: {len(open_ports(result))} open ports"
 
-    def _ingest_nmap(self, result: NmapResult):
-        for p in result.open_ports():
+    def _ingest_nmap(self, result: dict):
+        for p in open_ports(result):
             # Deduplicate by port number
             existing = [x["port"] for x in self.state.state["findings"]["open_ports"]]
             if p["port"] not in existing:
