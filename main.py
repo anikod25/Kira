@@ -1,591 +1,438 @@
 """
 main.py — Kira Autonomous Penetration Testing Agent
-CLI entry point and agent orchestration loop.
+=====================================================
+CLI entry point. Wires all Day 1-3 modules together and launches
+the Planner loop autonomously — no human input after startup.
 
 Usage:
-    python main.py --target 10.10.10.3
-    python main.py --target 10.10.10.3 --phase recon
-    python main.py --target 10.10.10.3 --output ./reports --verbose
+    python main.py --target 10.10.10.5 --authorized-by "Lab VM"
+    python main.py --target 10.10.10.5 --authorized-by "HTB" --ollama-host http://192.168.1.42:11434
+    python main.py --target 10.10.10.5 --authorized-by "test" --no-msf --verbose
+
+Changes from Day 1 version                             ← NEW Day 3
+─────────────────────────────────────────────────────
+  - Replaced inline StateManager / ToolExecutor / LLMPlanner with
+    the real kira.* module classes built Days 1-3.
+  - Added MSFClient instantiation + graceful degradation if msfrpcd
+    is not running (EXPLOIT phase skipped with a clear warning).
+  - Replaced hand-rolled agent loop with Planner.run().
+  - Added session summary table printed on exit.
+  - Kept original BANNER, color codes, and --authorized-by guard.
 """
 
 import argparse
-import json
-import logging
 import os
-import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
-from kira.parsers.nmap_parser import parse_nmap_xml, open_ports, summary
+# ── Kira modules ──────────────────────────────────────────────────────────────
+# Each import is wrapped so a missing file gives a clear message instead of
+# a cryptic ModuleNotFoundError.
 
-# ─────────────────────────────────────────────
-# Constants
-# ─────────────────────────────────────────────
+def _require_module(name: str, path: str):
+    try:
+        return __import__(name)
+    except ImportError:
+        print(f"[KIRA] ERROR: cannot import '{name}'. Is {path} in your project?")
+        sys.exit(1)
 
-VERSION = "0.1.0"
+from kira.state       import StateManager
+from kira.tool_runner import ToolRunner
+from kira.llm         import LLMClient
+from kira.planner     import Planner
 
-PHASES = ["recon", "enumeration", "exploitation", "privesc", "report"]
+# findings.py is built on Day 2 — import gracefully if missing
+try:
+    from kira.findings import KnowledgeBase
+    _KB_AVAILABLE = True
+except ImportError:
+    _KB_AVAILABLE = False
 
-# Add this near the top of main.py, after imports
+# MSF RPC — optional; only available after `gem install msfrpc` + msfrpcd running
+try:
+    from pymetasploit3.msfrpc import MsfRpcClient as _MsfRpcClient
+    _MSF_LIB_AVAILABLE = True
+except ImportError:
+    _MSF_LIB_AVAILABLE = False
+
+
+# ── Constants ──────────────────────────────────────────────────────────────────
+
+VERSION = "0.3.0"   # bumped Day 3
+
+PHASES = ["RECON", "ENUM", "VULN_SCAN", "EXPLOIT", "POST_EXPLOIT", "REPORT", "DONE"]
+
+MSF_DEFAULT_HOST = "127.0.0.1"
+MSF_DEFAULT_PORT = 55553
+MSF_DEFAULT_PASS = "kirapass"      # set with: msfrpcd -P kirapass -p 55553 -a 127.0.0.1
+
+
+# ── ANSI colour helper ─────────────────────────────────────────────────────────
 
 class C:
-    RED     = "\033[91m"
-    GREEN   = "\033[92m"
-    YELLOW  = "\033[93m"
-    BLUE    = "\033[94m"
-    MAGENTA = "\033[95m"
-    CYAN    = "\033[96m"
-    WHITE   = "\033[97m"
-    BOLD    = "\033[1m"
-    DIM     = "\033[2m"
-    RESET   = "\033[0m"
+    BLUE_BRIGHT = "\033[94m"
+    BLUE_DIM    = "\033[34m"
+    CYAN        = "\033[96m"
+    CYAN_DIM    = "\033[36m"
+    WHITE       = "\033[97m"
+    YELLOW      = "\033[93m"
+    GREEN       = "\033[92m"
+    DIM         = "\033[2m"
+    BOLD        = "\033[1m"
+    RESET       = "\033[0m"
+
 
 BANNER = f"""
-{C.RED}{C.BOLD}  _  ___           
- | |/ (_)_ _ __ _ 
+{C.BLUE_BRIGHT}{C.BOLD}  _  ___
+ | |/ (_)_ _ __ _
  | ' <| | '_/ _` |
- |_|\_\_|_| \__,_|{C.RESET}
-{C.DIM}  Autonomous Pentest Agent v{VERSION}{C.RESET}
-{C.YELLOW}  [!] Authorized environments only{C.RESET}
-"""
-# ─────────────────────────────────────────────
-# Logging setup
-# ─────────────────────────────────────────────
-
-def setup_logging(output_dir: Path, verbose: bool) -> logging.Logger:
-    log_path = output_dir / "kira.log"
-    handlers = [logging.FileHandler(log_path)]
-    if verbose:
-        handlers.append(logging.StreamHandler(sys.stdout))
-
-    logging.basicConfig(
-        level=logging.DEBUG if verbose else logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%H:%M:%S",
-        handlers=handlers,
-    )
-    return logging.getLogger("kira")
-
-
-# ─────────────────────────────────────────────
-# State Manager
-# ─────────────────────────────────────────────
-
-class StateManager:
-    """Persists agent state to disk as JSON between loop iterations."""
-
-    def __init__(self, state_path: Path):
-        self.path = state_path
-        self.state = self._default_state()
-        if state_path.exists():
-            self._load()
-
-    def _default_state(self) -> dict:
-        return {
-            "target": "",
-            "phase": "recon",
-            "completed_phases": [],
-            "findings": {
-                "open_ports": [],
-                "services": [],
-                "directories": [],
-                "vulnerabilities": [],
-                "credentials": [],
-                "exploits_attempted": [],
-                "flags": [],
-            },
-            "actions_taken": [],
-            "last_action": None,
-            "last_action_time": None,
-            "scan_files": {},
-        }
-
-    def _load(self):
-        with open(self.path) as f:
-            self.state = json.load(f)
-
-    def save(self):
-        with open(self.path, "w") as f:
-            json.dump(self.state, f, indent=2)
-
-    def set(self, key: str, value):
-        self.state[key] = value
-        self.save()
-
-    def get(self, key: str, default=None):
-        return self.state.get(key, default)
-
-    def add_finding(self, category: str, finding: dict):
-        self.state["findings"][category].append(finding)
-        self.save()
-
-    def log_action(self, tool: str, args: dict, result: str, reasoning: str = ""):
-        entry = {
-            "timestamp": datetime.now().isoformat(),
-            "tool": tool,
-            "args": args,
-            "result_summary": result[:300],  # keep state file lean
-            "reasoning": reasoning,
-        }
-        self.state["actions_taken"].append(entry)
-        self.state["last_action"] = tool
-        self.state["last_action_time"] = entry["timestamp"]
-        self.save()
-
-    def get_context_summary(self) -> str:
-        """
-        Compact summary injected into every LLM prompt — keep under ~400 tokens.
-        """
-        s = self.state
-        findings = s["findings"]
-
-        lines = [
-            f"Target: {s['target']}",
-            f"Current phase: {s['phase']}",
-            f"Completed phases: {', '.join(s['completed_phases']) or 'none'}",
-            f"Last action: {s['last_action'] or 'none'}",
-            "",
-            f"Open ports ({len(findings['open_ports'])}):",
-        ]
-        for p in findings["open_ports"][:10]:  # cap at 10
-            lines.append(f"  {p.get('port')}/{p.get('protocol')} {p.get('service')} {p.get('product','')} {p.get('version','')}".rstrip())
-
-        if findings["directories"]:
-            lines.append(f"\nDiscovered paths ({len(findings['directories'])}):")
-            for d in findings["directories"][:8]:
-                lines.append(f"  {d}")
-
-        if findings["vulnerabilities"]:
-            lines.append(f"\nVulnerabilities ({len(findings['vulnerabilities'])}):")
-            for v in findings["vulnerabilities"][:5]:
-                lines.append(f"  [{v.get('severity','?')}] {v.get('title','?')}")
-
-        if s["actions_taken"]:
-            last3 = s["actions_taken"][-3:]
-            lines.append("\nLast 3 actions:")
-            for a in last3:
-                lines.append(f"  {a['tool']} — {a['result_summary'][:80]}")
-
-        return "\n".join(lines)
-
-    def advance_phase(self):
-        current = self.state["phase"]
-        if current not in self.state["completed_phases"]:
-            self.state["completed_phases"].append(current)
-        idx = PHASES.index(current)
-        if idx + 1 < len(PHASES):
-            self.state["phase"] = PHASES[idx + 1]
-        self.save()
-
-
-# ─────────────────────────────────────────────
-# Tool Executor
-# ─────────────────────────────────────────────
-
-class ToolExecutor:
-    def __init__(self, output_dir: Path, logger: logging.Logger, timeout: int = 300):
-        self.output_dir = output_dir
-        self.logger = logger
-        self.timeout = timeout
-
-    def run(self, command: list[str], label: str) -> tuple[str, str, int]:
-        """
-        Execute a shell command, stream stdout to log, return (stdout, stderr, returncode).
-        """
-        self.logger.info(f"[EXEC] {' '.join(command)}")
-        try:
-            proc = subprocess.Popen(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-            stdout, stderr = proc.communicate(timeout=self.timeout)
-            if proc.returncode != 0:
-                self.logger.warning(f"[{label}] exited {proc.returncode}: {stderr[:200]}")
-            return stdout, stderr, proc.returncode
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            self.logger.error(f"[{label}] timed out after {self.timeout}s")
-            return "", "timeout", -1
-        except FileNotFoundError:
-            self.logger.error(f"[{label}] tool not found: {command[0]}")
-            return "", f"tool not found: {command[0]}", -1
-
-    def nmap_scan(self, target: str) -> Path:
-        xml_out = self.output_dir / "nmap_initial.xml"
-        command = [
-            "nmap", "-sV", "-sC",
-            "-oX", str(xml_out),
-            target,
-        ]
-        self.run(command, "nmap")
-        return xml_out
-
-    def nmap_full(self, target: str) -> Path:
-        xml_out = self.output_dir / "nmap_full.xml"
-        command = [
-            "nmap", "-sV", "-sC", "-p-",
-            "--min-rate", "1000",
-            "-oX", str(xml_out),
-            target,
-        ]
-        self.run(command, "nmap-full")
-        return xml_out
-
-    def gobuster(self, target_url: str, wordlist: str = "/usr/share/wordlists/dirb/common.txt") -> str:
-        out_file = self.output_dir / "gobuster.txt"
-        command = [
-            "gobuster", "dir",
-            "-u", target_url,
-            "-w", wordlist,
-            "-o", str(out_file),
-            "-q",
-        ]
-        stdout, _, _ = self.run(command, "gobuster")
-        return str(out_file) if out_file.exists() else stdout
-
-
-# ─────────────────────────────────────────────
-# LLM Planner
-# ─────────────────────────────────────────────
-
-class LLMPlanner:
-    """
-    Calls Gemma 3 4B via Ollama to decide the next action.
-    Returns a structured action dict: {tool, args, reasoning}
-    """
-
-    TOOL_SCHEMA = """
-Available tools:
-  nmap_initial   — Fast version/script scan. Args: {target: str}
-  nmap_full      — Full port scan (-p-). Args: {target: str}
-  gobuster       — Directory brute-force. Args: {url: str, wordlist: str (optional)}
-  metasploit     — Run an MSF module. Args: {module: str, options: dict}
-  run_shell      — Run arbitrary shell command. Args: {command: str}
-  advance_phase  — Move to next pentest phase. Args: {}
-  generate_report — Write final report. Args: {}
-  done           — Target fully compromised or no further actions possible. Args: {}
+ |_|\\_\\_|_| \\__,_|{C.RESET}
+{C.DIM}{C.CYAN}  AUTONOMOUS PENTEST AGENT v{VERSION}{C.RESET}
+{C.YELLOW}  ⚠  Authorized environments only{C.RESET}
 """
 
-    SYSTEM_PROMPT = """You are Kira, a senior penetration tester AI agent.
-You receive the current state of a pentest and decide the single best next action.
-
-Rules:
-- Only target the provided IP. Never attack anything else.
-- Always reply with ONLY valid JSON — no prose, no markdown fences.
-- Format: {"tool": "<name>", "args": {<key>: <value>}, "reasoning": "<1 sentence>"}
-- Be methodical: recon → enumeration → exploitation → privesc → report.
-- Do not repeat an action already taken unless you have new information.
-- If you have enough recon data, call advance_phase to move forward.
-""" + TOOL_SCHEMA
-
-    def __init__(self, host: str = "http://localhost:11434", model: str = "gemma3:4b", logger: logging.Logger = None):
-        self.host = host.rstrip("/")
-        self.model = model
-        self.logger = logger or logging.getLogger("kira.planner")
-
-    def decide(self, context: str) -> dict:
-        prompt = f"Current pentest state:\n{context}\n\nWhat is the single best next action?"
-        payload = {
-            "model": self.model,
-            "messages": [
-                {"role": "system", "content": self.SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ],
-            "stream": False,
-            "format": "json",
-        }
-
-        try:
-            import urllib.request
-            data = json.dumps(payload).encode()
-            req = urllib.request.Request(
-                f"{self.host}/api/chat",
-                data=data,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=60) as resp:
-                body = json.loads(resp.read())
-                content = body["message"]["content"]
-                action = json.loads(content)
-                self.logger.debug(f"[LLM] decided: {action}")
-                return action
-        except Exception as e:
-            self.logger.error(f"[LLM] failed: {e}")
-            # Safe fallback: continue with nmap if planner is down
-            return {
-                "tool": "nmap_initial",
-                "args": {},
-                "reasoning": "LLM unavailable — falling back to initial scan",
-            }
+# STATUS_BOX = f"""
+# {C.BLUE_DIM}┌─────────────────────────────┐
+# │{C.RESET} {C.CYAN_DIM}SYSTEM STATUS{C.RESET}                {C.BLUE_DIM}│
+# ├─────────────────────────────┤
+# │{C.RESET}  Target  {C.BLUE_DIM}────{C.RESET}  192.168.1.0/24 {C.BLUE_DIM}│
+# │{C.RESET}  Mode    {C.BLUE_DIM}────{C.RESET}  Stealth Recon  {C.BLUE_DIM}│
+# │{C.RESET}  Threads {C.BLUE_DIM}────{C.RESET}  {C.GREEN}16 / active{C.RESET}    {C.BLUE_DIM}│
+# │{C.RESET}  Auth    {C.BLUE_DIM}────{C.RESET}  {C.GREEN}✓ Verified{C.RESET}     {C.BLUE_DIM}│
+# └─────────────────────────────┘{C.RESET}
+# """
 
 
-# ─────────────────────────────────────────────
-# Agent Loop
-# ─────────────────────────────────────────────
+# ── MSF connection helper ──────────────────────────────────────────────────────
 
-class KiraAgent:
-    def __init__(
-        self,
-        target: str,
-        output_dir: Path,
-        ollama_host: str,
-        start_phase: str,
-        verbose: bool,
-        max_iterations: int = 30,
+class MSFClient:
+    """
+    Thin wrapper around pymetasploit3.MsfRpcClient.
+    Exposes a connect() class method that returns (client, ok, message).
+    Used by main() so the rest of the code never imports pymetasploit3 directly.
+    """
+
+    @classmethod
+    def connect(
+        cls,
+        host:     str = MSF_DEFAULT_HOST,
+        port:     int = MSF_DEFAULT_PORT,
+        password: str = MSF_DEFAULT_PASS,
+        ssl:      bool = True,
     ):
-        self.target = target
-        self.output_dir = output_dir
-        self.max_iterations = max_iterations
+        """
+        Attempt to connect to msfrpcd.
 
-        output_dir.mkdir(parents=True, exist_ok=True)
+        Returns
+        -------
+        (client, True,  "connected")              on success
+        (None,   False, "<reason string>")        on failure
+        """
+        if not _MSF_LIB_AVAILABLE:
+            return None, False, (
+                "pymetasploit3 not installed. "
+                "Run: pip install pymetasploit3"
+            )
 
-        self.logger = setup_logging(output_dir, verbose)
-        self.state = StateManager(output_dir / "state.json")
-        self.executor = ToolExecutor(output_dir, self.logger)
-        self.planner = LLMPlanner(host=ollama_host, logger=self.logger)
+        try:
+            client = _MsfRpcClient(password, server=host, port=port, ssl=ssl)
+            return client, True, f"connected to {host}:{port}"
+        except ConnectionRefusedError:
+            return None, False, (
+                f"msfrpcd not running on {host}:{port}. "
+                f"Start it: msfrpcd -P {password} -p {port} -a {host}"
+            )
+        except Exception as exc:
+            return None, False, f"MSF connection error: {exc}"
 
-        # Initialise state
-        self.state.set("target", target)
-        if self.state.get("phase") == "recon" and start_phase:
-            self.state.set("phase", start_phase)
 
-    # ── Action dispatch ───────────────────────
+# ── Session summary ────────────────────────────────────────────────────────────
 
-    def _dispatch(self, action: dict) -> str:
-        tool = action.get("tool", "")
-        args = action.get("args", {})
-        reasoning = action.get("reasoning", "")
+def _print_session_summary(state: StateManager, session_dir: Path, elapsed_s: float):
+    """Print a compact summary table after the planner loop exits."""
+    findings  = state.get("findings") or []
+    ports     = state.get("open_ports") or []
+    sessions  = state.get("sessions") or []
+    is_root   = state.get("is_root", False)
+    phase     = state.get("phase", "?")
 
-        self.logger.info(f"[ACTION] {tool} | {reasoning}")
+    # Action log stats
+    log_path = session_dir / "actions.jsonl"
+    stats    = ToolRunner.summarise_action_log(str(log_path))
 
-        if tool == "nmap_initial":
-            return self._do_nmap_initial()
+    sev_counts: dict[str, int] = {}
+    for f in findings:
+        sev = f.get("severity", "info")
+        sev_counts[sev] = sev_counts.get(sev, 0) + 1
 
-        elif tool == "nmap_full":
-            return self._do_nmap_full()
+    print(f"\n{C.BOLD}{'─' * 50}{C.RESET}")
+    print(f"{C.BOLD}  Kira Session Summary{C.RESET}")
+    print(f"{'─' * 50}")
+    print(f"  Target          {state.target}")
+    print(f"  Final phase     {phase}")
+    print(f"  Root obtained   {'YES ✓' if is_root else 'no'}")
+    print(f"  Sessions open   {len(sessions)}")
+    print(f"  Open ports      {len(ports)}")
+    print(f"  Findings        {len(findings)}  "
+          + "  ".join(f"{C.RED if k=='critical' else C.YELLOW}{k}:{v}{C.RESET}"
+                      for k, v in sev_counts.items()))
+    print(f"  Actions run     {stats['total_actions']}  "
+          f"(ok={stats['successful']}  failed={stats['failed']})")
+    print(f"  Tools used      {', '.join(stats['tools_used']) or 'none'}")
+    print(f"  Elapsed         {elapsed_s:.0f}s")
+    print(f"  Session dir     {session_dir}")
+    print(f"{'─' * 50}")
 
-        elif tool == "gobuster":
-            url = args.get("url", f"http://{self.target}")
-            wordlist = args.get("wordlist", "/usr/share/wordlists/dirb/common.txt")
-            return self._do_gobuster(url, wordlist)
-
-        elif tool == "metasploit":
-            module = args.get("module", "")
-            options = args.get("options", {})
-            return self._do_metasploit(module, options)
-
-        elif tool == "run_shell":
-            command = args.get("command", "")
-            if not command:
-                return "no command provided"
-            stdout, stderr, rc = self.executor.run(command.split(), "shell")
-            return stdout or stderr
-
-        elif tool == "advance_phase":
-            old = self.state.get("phase")
-            self.state.advance_phase()
-            new = self.state.get("phase")
-            return f"Advanced from {old} → {new}"
-
-        elif tool == "generate_report":
-            return self._do_generate_report()
-
-        elif tool == "done":
-            return "DONE"
-
-        else:
-            return f"Unknown tool: {tool}"
-
-    # ── Phase actions ─────────────────────────
-
-    def _do_nmap_initial(self) -> str:
-        xml_path = self.executor.nmap_scan(self.target)
-        if not xml_path.exists():
-            return "nmap scan failed — XML not found"
-        result = parse_nmap_xml(str(xml_path))
-        self._ingest_nmap(result)
-        self.state.state["scan_files"]["nmap_initial"] = str(xml_path)
-        self.state.save()
-        return f"Found {len(open_ports(result))} open ports\n{summary(result)}"
-
-    def _do_nmap_full(self) -> str:
-        xml_path = self.executor.nmap_full(self.target)
-        if not xml_path.exists():
-            return "full nmap scan failed"
-        result = parse_nmap_xml(str(xml_path))
-        self._ingest_nmap(result)
-        self.state.state["scan_files"]["nmap_full"] = str(xml_path)
-        self.state.save()
-        return f"Full scan: {len(open_ports(result))} open ports"
-
-    def _ingest_nmap(self, result: dict):
-        for p in open_ports(result):
-            # Deduplicate by port number
-            existing = [x["port"] for x in self.state.state["findings"]["open_ports"]]
-            if p["port"] not in existing:
-                self.state.add_finding("open_ports", p)
-
-    def _do_gobuster(self, url: str, wordlist: str) -> str:
-        out = self.executor.gobuster(url, wordlist)
-        # Parse output file line by line
-        out_path = self.output_dir / "gobuster.txt"
-        if out_path.exists():
-            with open(out_path) as f:
-                dirs = [
-                    line.split()[0].strip()
-                    for line in f
-                    if line.strip() and not line.startswith("Error")
-                ]
-            for d in dirs:
-                self.state.add_finding("directories", d)
-            return f"Found {len(dirs)} paths: {dirs[:5]}"
-        return "gobuster produced no output"
-
-    def _do_metasploit(self, module: str, options: dict) -> str:
-        if not module:
-            return "no module specified"
-        # Build resource script
-        rc_path = self.output_dir / "exploit.rc"
-        out_path = self.output_dir / "msf_output.txt"
-        lines = [f"use {module}"]
-        for k, v in options.items():
-            lines.append(f"set {k} {v}")
-        lines += ["run", "exit -y"]
-        rc_path.write_text("\n".join(lines))
-
-        stdout, stderr, rc = self.executor.run(
-            ["msfconsole", "-q", "-r", str(rc_path), "-o", str(out_path)],
-            "metasploit",
+    if findings:
+        print(f"\n{C.BOLD}  Top findings:{C.RESET}")
+        sorted_findings = sorted(
+            findings,
+            key=lambda f: f.get("cvss", 0),
+            reverse=True,
         )
-        result_text = out_path.read_text() if out_path.exists() else stdout
-        # Basic success detection
-        success = any(kw in result_text for kw in ["Meterpreter session", "Command shell session", "root@"])
-        status = "SUCCESS" if success else "no session"
-        self.state.add_finding("exploits_attempted", {
-            "module": module,
-            "options": options,
-            "status": status,
-        })
-        return f"MSF {module}: {status}\n{result_text[:500]}"
+        for f in sorted_findings[:5]:
+            sev = f.get("severity", "info").upper()
+            color = {
+                "CRITICAL": C.RED, "HIGH": C.RED,
+                "MEDIUM": C.YELLOW, "LOW": C.BLUE,
+            }.get(sev, C.DIM)
+            print(f"  {color}[{sev:8s}]{C.RESET} CVSS {f.get('cvss', '?'):<4}  "
+                  f"port {f.get('port', '?'):<5}  {f.get('title', 'untitled')}")
 
-    def _do_generate_report(self) -> str:
-        from kira.reporter import generate_report  # imported lazily (Day 4 module)
-        report_path = generate_report(self.state.state, self.output_dir)
-        return f"Report written to {report_path}"
-
-    # ── Main loop ─────────────────────────────
-
-    def run(self):
-        self.logger.info(f"Kira starting — target: {self.target}")
-        print(f"\n[*] Target: {self.target}")
-        print(f"[*] Output: {self.output_dir}")
-        print(f"[*] Phase:  {self.state.get('phase')}\n")
-
-        for i in range(1, self.max_iterations + 1):
-            phase = self.state.get("phase")
-            self.logger.info(f"── Iteration {i}/{self.max_iterations} | phase={phase} ──")
-            print(f"[{i:02d}] Phase: {phase}", end="  ", flush=True)
-
-            # Get LLM decision
-            context = self.state.get_context_summary()
-            action = self.planner.decide(context)
-            tool = action.get("tool", "unknown")
-            print(f"→ {tool}")
-
-            # Execute
-            result = self._dispatch(action)
-            self.state.log_action(tool, action.get("args", {}), result, action.get("reasoning", ""))
-
-            if result == "DONE":
-                self.logger.info("Agent signalled DONE")
-                print("\n[✓] Agent completed — target fully processed")
-                break
-
-            # Small delay to avoid hammering the LLM
-            time.sleep(1)
-
-        else:
-            self.logger.warning("Max iterations reached")
-            print(f"\n[!] Max iterations ({self.max_iterations}) reached")
-
-        # Always print final state summary
-        print("\n── Final Findings ──────────────────────")
-        print(self.state.get_context_summary())
-        print(f"\n[*] Full log: {self.output_dir / 'kira.log'}")
-        print(f"[*] State:    {self.output_dir / 'state.json'}")
+    print()
 
 
-# ─────────────────────────────────────────────
-# CLI
-# ─────────────────────────────────────────────
+# ── CLI argument parser ────────────────────────────────────────────────────────
 
-def parse_args():
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="kira",
         description="Kira — Autonomous Penetration Testing Agent",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="  Example: python main.py --target 10.10.10.3 --verbose\n"
-               "  [!] Only use against authorized targets.",
+        epilog=(
+            "Examples:\n"
+            "  python main.py --target 10.10.10.5 --authorized-by 'HTB Lab'\n"
+            "  python main.py --target 10.10.10.5 --authorized-by 'test' --no-msf\n"
+            "\n"
+            "  [!] Only use against targets you are explicitly authorized to test."
+        ),
     )
-    parser.add_argument("--target", required=True, help="Target IP or hostname")
+
     parser.add_argument(
-        "--phase",
-        choices=PHASES,
-        default="recon",
-        help="Start from a specific phase (default: recon)",
+        "--target", "-t",
+        required=True,
+        help="Target IP address or hostname",
     )
     parser.add_argument(
-        "--output",
-        default="./kira_output",
-        help="Directory for logs, scan files, and reports (default: ./kira_output)",
+        "--authorized-by",
+        required=True,
+        metavar="AUTHORIZATION",
+        help="Required: written confirmation of authorization (e.g. 'HTB Lab VM')",
     )
     parser.add_argument(
         "--ollama-host",
         default=os.getenv("OLLAMA_HOST", "http://localhost:11434"),
-        help="Ollama API host (default: http://localhost:11434, or $OLLAMA_HOST env var)",
+        metavar="URL",
+        help="Ollama API URL (default: http://localhost:11434 or $OLLAMA_HOST)",
+    )
+    parser.add_argument(
+        "--output", "-o",
+        default="./kira_sessions",
+        metavar="DIR",
+        help="Root directory for session output (default: ./kira_sessions)",
     )
     parser.add_argument(
         "--max-iter",
         type=int,
-        default=30,
-        help="Maximum agent loop iterations (default: 30)",
+        default=50,
+        metavar="N",
+        help="Maximum planner loop iterations (default: 50)",
     )
-    parser.add_argument("--verbose", "-v", action="store_true", help="Print logs to stdout")
-    parser.add_argument("--version", action="version", version=f"Kira {VERSION}")
-    return parser.parse_args()
 
+    # MSF options
+    msf_group = parser.add_argument_group("Metasploit RPC (optional)")
+    msf_group.add_argument(
+        "--no-msf",
+        action="store_true",
+        help="Disable Metasploit integration (RECON→VULN_SCAN only)",
+    )
+    msf_group.add_argument(
+        "--msf-host",   default=MSF_DEFAULT_HOST, help=f"msfrpcd host (default: {MSF_DEFAULT_HOST})",
+    )
+    msf_group.add_argument(
+        "--msf-port",   type=int, default=MSF_DEFAULT_PORT, help=f"msfrpcd port (default: {MSF_DEFAULT_PORT})",
+    )
+    msf_group.add_argument(
+        "--msf-pass",   default=MSF_DEFAULT_PASS, help="msfrpcd password",
+    )
+    msf_group.add_argument(
+        "--msf-no-ssl", action="store_true",      help="Disable SSL for msfrpcd connection",
+    )
+
+    parser.add_argument(
+        "--verbose", "-v",
+        action="store_true",
+        help="Verbose output (tool stdout streamed to terminal)",
+    )
+    parser.add_argument(
+        "--version", action="version", version=f"Kira {VERSION}",
+    )
+
+    return parser
+
+
+# ── Main ───────────────────────────────────────────────────────────────────────
 
 def main():
-    print(BANNER.format(version=VERSION))
-    print(f"{C.DIM}{'─' * 45}{C.RESET}")
+    print(BANNER)
+    print(f"{C.DIM}{'─' * 50}{C.RESET}")
     print(f"  {C.YELLOW}WARNING:{C.RESET} For authorized environments only.")
-    print(f"  Unauthorized use is illegal.")
-    print(f"{C.DIM}{'─' * 45}{C.RESET}")
-    confirm = input(f"\n  Confirm target is authorized {C.GREEN}[y/N]{C.RESET}: ").strip().lower()
+    print(f"  Unauthorized use is illegal and unethical.")
+    print(f"{C.DIM}{'─' * 50}{C.RESET}\n")
 
-    if confirm != "y":
-        print("Aborted.")
-        sys.exit(0)
+    parser = _build_parser()
+    args   = parser.parse_args()
 
-    args = parse_args()
+    # ── 1. Parse args early so --version/--help work before the prompt ────────
+    # Authorization confirmation is enforced by --authorized-by flag, but we
+    # also print a visible reminder at startup.
+    print(f"  Target        : {C.CYAN}{args.target}{C.RESET}")
+    print(f"  Authorized by : {C.GREEN}{args.authorized_by}{C.RESET}")
+    print(f"  Ollama host   : {args.ollama_host}")
+    print(f"  MSF           : {'disabled (--no-msf)' if args.no_msf else f'{args.msf_host}:{args.msf_port}'}")
+    print()
 
-    output_dir = Path(args.output) / args.target.replace(".", "_")
+    # ── 2. Session directory ──────────────────────────────────────────────────
+    safe_target  = args.target.replace(".", "_").replace("/", "_")
+    timestamp    = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    session_dir  = Path(args.output) / f"{safe_target}_{timestamp}"
+    session_dir.mkdir(parents=True, exist_ok=True)
+    print(f"  Session dir   : {session_dir}\n")
 
-    agent = KiraAgent(
-        target=args.target,
-        output_dir=output_dir,
-        ollama_host=args.ollama_host,
-        start_phase=args.phase,
+    # ── 3. StateManager ───────────────────────────────────────────────────────
+    state = StateManager(session_dir=str(session_dir))
+    state.init(target=args.target, authorized_by=args.authorized_by)
+
+    # ── 4. LLM client + ping ──────────────────────────────────────────────────
+    print(f"{C.DIM}[INIT] Connecting to LLM at {args.ollama_host}...{C.RESET}")
+    llm = LLMClient(
+        host=args.ollama_host,
         verbose=args.verbose,
-        max_iterations=args.max_iter,
     )
-    agent.run()
+    llm_ok, llm_msg = llm.ping()
+    if llm_ok:
+        print(f"{C.GREEN}[OK  ] LLM: {llm_msg}{C.RESET}")
+    else:
+        print(f"{C.RED}[FAIL] LLM: {llm_msg}{C.RESET}")
+        print(f"\n  Kira cannot run without a working LLM connection.")
+        print(f"  Fix: ensure Ollama is running on {args.ollama_host}")
+        print(f"       ollama pull gemma3:4b && OLLAMA_HOST=0.0.0.0 ollama serve")
+        sys.exit(1)
+
+    # ── 5. MSF client (optional — graceful degradation if unavailable) ────────
+    # NEW Day 3: attempt MSF connection; if it fails, Kira continues but the
+    # EXPLOIT phase will be skipped by the planner (msf_exploit returns an
+    # informative error string instead of crashing).
+
+    msf_client = None
+
+    if args.no_msf:
+        print(f"{C.YELLOW}[SKIP] MSF disabled via --no-msf flag{C.RESET}")
+        print(f"       Kira will run RECON → ENUM → VULN_SCAN then stop before EXPLOIT.")
+    else:
+        print(f"{C.DIM}[INIT] Connecting to msfrpcd at {args.msf_host}:{args.msf_port}...{C.RESET}")
+        msf_client, msf_ok, msf_msg = MSFClient.connect(      # ← NEW Day 3
+            host=args.msf_host,
+            port=args.msf_port,
+            password=args.msf_pass,
+            ssl=not args.msf_no_ssl,
+        )
+        if msf_ok:
+            print(f"{C.GREEN}[OK  ] MSF: {msf_msg}{C.RESET}")
+        else:
+            print(f"{C.YELLOW}[WARN] MSF unavailable: {msf_msg}{C.RESET}")
+            print(f"       Kira will run RECON → ENUM → VULN_SCAN then stop before EXPLOIT.")
+            print(f"       To enable exploitation, start msfrpcd:")
+            print(f"         msfrpcd -P {args.msf_pass} -p {args.msf_port} -a {args.msf_host}")
+            msf_client = None   # explicit — planner handles None gracefully
+
+    # ── 6. ToolRunner ─────────────────────────────────────────────────────────
+    runner = ToolRunner(                                        # ← NEW Day 3: passes msf
+        session_dir=str(session_dir),
+        verbose=args.verbose,
+        msf=msf_client,
+    )
+
+    # Print tool availability at startup
+    avail  = runner.check_tools()
+    missing = [t for t, ok in avail.items() if not ok]
+    present = [t for t, ok in avail.items() if ok]
+    if present:
+        print(f"{C.DIM}[TOOLS] Available: {', '.join(present)}{C.RESET}")
+    if missing:
+        print(f"{C.YELLOW}[WARN ] Missing:   {', '.join(missing)}{C.RESET}")
+        print(f"        Install missing tools for full coverage.")
+
+    # ── 7. KnowledgeBase (optional — Day 2 module) ────────────────────────────
+    kb = KnowledgeBase() if _KB_AVAILABLE else None
+    if not _KB_AVAILABLE:
+        print(f"{C.DIM}[INFO] findings.py not yet built — kb=None (state.add_finding used){C.RESET}")
+
+    # ── 8. Planner ────────────────────────────────────────────────────────────
+    planner = Planner(                                          # ← NEW Day 3
+        state=state,
+        runner=runner,
+        llm=llm,
+        msf=msf_client,
+        kb=kb,
+        verbose=True,
+    )
+
+    # ── 9. Run ────────────────────────────────────────────────────────────────
+    print(f"\n{C.GREEN}{C.BOLD}[KIRA] Agent loop starting...{C.RESET}")
+    print(f"{C.DIM}       Target: {args.target}  |  Max iterations: {args.max_iter}{C.RESET}\n")
+
+    t_start = time.monotonic()
+
+    try:
+        outcome = planner.run(max_iterations=args.max_iter)    # ← NEW Day 3
+    except KeyboardInterrupt:
+        outcome = "INTERRUPTED"
+        print(f"\n{C.YELLOW}[KIRA] Interrupted by user.{C.RESET}")
+    except Exception as exc:
+        outcome = "ERROR"
+        print(f"\n{C.RED}[KIRA] Unhandled error: {exc}{C.RESET}")
+        import traceback; traceback.print_exc()
+
+    elapsed = time.monotonic() - t_start
+
+    # ── 10. Exit summary ──────────────────────────────────────────────────────
+    outcome_colors = {
+        "DONE":        C.GREEN,
+        "ROOT":        C.GREEN,
+        "HALTED":      C.YELLOW,
+        "MAX_ITER":    C.YELLOW,
+        "INTERRUPTED": C.YELLOW,
+        "ERROR":       C.RED,
+    }
+    color = outcome_colors.get(outcome, C.DIM)
+    print(f"\n{color}{C.BOLD}[KIRA] Session ended: {outcome}{C.RESET}")
+
+    _print_session_summary(state, session_dir, elapsed)        # ← NEW Day 3
+
+    # Remind user of next step
+    if outcome == "DONE":
+        print(f"  {C.DIM}Next: run reporter.py to generate the full pentest report.{C.RESET}")
+    elif outcome in ("HALTED", "MAX_ITER"):
+        print(f"  {C.DIM}Tip: review {session_dir}/actions.jsonl for why the agent stopped.{C.RESET}")
+    if not msf_client and not args.no_msf:
+        print(f"  {C.DIM}Tip: start msfrpcd to enable the EXPLOIT phase next run.{C.RESET}")
+
+    print()
+    return 0 if outcome in ("DONE", "ROOT") else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
