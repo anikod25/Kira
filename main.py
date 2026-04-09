@@ -215,7 +215,12 @@ def build_msf(no_msf: bool, args):
         try:
             from kira.msf_client import MSFClient as AutoMSFClient
             auto = AutoMSFClient()
-            if auto.auto_start(host=args.msf_host, port=args.msf_port, password=args.msf_pass):
+            if auto.auto_start(
+                host=args.msf_host,
+                port=args.msf_port,
+                password=args.msf_pass,
+                ssl=not args.msf_no_ssl,
+            ):
                 _print_ok(
                     f"Metasploit RPC auto-started and connected: "
                     f"{args.msf_host}:{args.msf_port}"
