@@ -343,6 +343,11 @@ class MSFClient:
     def is_connected(self) -> bool:
         return self.connected and self._client is not None
 
+    @property
+    def client(self):
+        """Raw pymetasploit3 client for direct planner access."""
+        return self._client
+
 
 # ─────────────────────────────────────────────
 # CLI smoke test

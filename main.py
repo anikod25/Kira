@@ -64,8 +64,8 @@ except ImportError:
 
 
 # ── Constants ──────────────────────────────────────────────────────────────────
-# CONFLICT RESOLUTION: kept development values (VERSION=0.3.0, max_iter=50)
-# Discarded: main branch's VERSION string and max_iter default of 5.
+# CONFLICT RESOLUTION: kept development values (VERSION=0.3.0).
+# Default max iterations set to 10 for faster runs.
 
 VERSION = "0.3.0"
 
@@ -373,8 +373,7 @@ def _die(msg: str) -> None:
 
 
 # ── CLI argument parser ────────────────────────────────────────────────────────
-# CONFLICT RESOLUTION: kept development's --max-iter default of 50.
-# Discarded: main branch's default of 5 (too low for a real pentest).
+# Default max iterations set to 10.
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -413,8 +412,8 @@ def _build_parser() -> argparse.ArgumentParser:
     # Session
     parser.add_argument("--session-dir", default=None,
                         help="Custom session directory (auto-generated if not set)")
-    parser.add_argument("--max-iter", type=int, default=50, metavar="N",
-                        help="Maximum planner loop iterations (default: 50)")
+    parser.add_argument("--max-iter", type=int, default=10, metavar="N",
+                        help="Maximum planner loop iterations (default: 10)")
 
     msf = parser.add_argument_group("Metasploit RPC (optional)")
     msf.add_argument("--no-msf", action="store_true",

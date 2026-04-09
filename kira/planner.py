@@ -7,7 +7,7 @@ auto-advancing phases when completion criteria are met.
 
 Architecture:
     Planner.__init__(state, runner, llm, msf, kb)
-    Planner.run(max_iterations=50) -> str
+    Planner.run(max_iterations=10) -> str
         └─ loop:
             1. Observe  — state.get_context_summary() + PhaseController focus
             2. Think    — llm.next_action(context, phase) → action dict
@@ -25,7 +25,7 @@ Usage (from main.py):
     from kira.planner import Planner
 
     planner = Planner(state=sm, runner=runner, llm=llm, msf=None, kb=kb)
-    reason  = planner.run(max_iterations=50)
+    reason  = planner.run(max_iterations=10)
     print(f"Session ended: {reason}")
 """
 
@@ -171,7 +171,7 @@ class Planner:
 
     # ── Public: run ────────────────────────────────────────────────────────────
 
-    def run(self, max_iterations: int = 50) -> str:
+    def run(self, max_iterations: int = 10) -> str:
         """
         Execute the agent loop until a terminal condition is reached.
 
