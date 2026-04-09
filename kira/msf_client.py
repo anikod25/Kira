@@ -115,7 +115,7 @@ class MSFClient:
                 password,
                 server=host,
                 port=port,
-                ssl=False,
+                ssl=True,
             )
             self.connected = True
             self.log.info(f"[MSF] Connected to msfrpcd at {host}:{port}")

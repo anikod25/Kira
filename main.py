@@ -36,6 +36,7 @@ try:
     from kira.planner     import Planner
     from kira.logger      import KiraLogger
     from kira.reporter    import ReportGenerator
+    from kira.guardrails  import ScopeGuard
 except ImportError as e:
     # Fallback for legacy execution contexts where modules are imported
     # from a flat path.
@@ -47,6 +48,7 @@ except ImportError as e:
         from planner     import Planner
         from logger      import KiraLogger
         from reporter    import ReportGenerator
+        from guardrails  import ScopeGuard
     except ImportError:
         print(f"[ERROR] Failed to import Kira module: {e}")
         print("        Run from the repository root with: python main.py ...")
@@ -186,7 +188,13 @@ def build_llm(args, verbose: bool) -> LLMClient:
 # ── MSF factory ───────────────────────────────────────────────────────────────
 
 def build_msf(no_msf: bool, args):
-    """Try to attach MSFClient. Returns None if --no-msf or unavailable."""
+    """
+    Try to attach Metasploit RPC client.
+    Strategy:
+      1) connect to existing msfrpcd (current behavior)
+      2) if unavailable and SSL mode is enabled, try auto-start wrapper client
+    Returns None if unavailable.
+    """
     if no_msf:
         _print_warn("--no-msf flag set — Metasploit integration disabled")
         return None
@@ -199,8 +207,24 @@ def build_msf(no_msf: bool, args):
         if msf_ok:
             _print_ok(f"Metasploit RPC connected: {msf_msg}")
             return msf_client
-        else:
-            _print_warn(f"MSF unavailable: {msf_msg}")
+        _print_warn(f"MSF unavailable: {msf_msg}")
+
+        # Auto-start fallback (SSL mode only).
+        if args.msf_no_ssl:
+            return None
+        try:
+            from kira.msf_client import MSFClient as AutoMSFClient
+            auto = AutoMSFClient()
+            if auto.auto_start(host=args.msf_host, port=args.msf_port, password=args.msf_pass):
+                _print_ok(
+                    f"Metasploit RPC auto-started and connected: "
+                    f"{args.msf_host}:{args.msf_port}"
+                )
+                return auto
+            _print_warn("MSF auto-start failed — continuing without Metasploit")
+            return None
+        except Exception as auto_exc:
+            _print_warn(f"MSF auto-start error: {auto_exc}")
             return None
     except Exception as e:
         _print_warn(f"MSF init error: {e}")
@@ -448,6 +472,10 @@ def main():
     state.init(target=args.target, authorized_by=args.authorized_by)
     _print_ok(f"Target: {args.target}  |  Authorized by: {args.authorized_by}")
 
+    # ── Scope guardrails ──────────────────────────────────────────────────────
+    guard = ScopeGuard(authorized_target=args.target, authorized_by=args.authorized_by)
+    guard.validate_startup(log)
+
     # ── LLM client + ping ──────────────────────────────────────────────────────
     _print_section("CONNECTING TO LLM")
     llm = build_llm(args, verbose)
@@ -494,8 +522,16 @@ def main():
     _print_section("STARTING AGENT LOOP")
     log.info(f"Agent loop starting: max_iter={args.max_iter}")
 
-    planner = Planner(state=state, runner=runner, llm=llm,
-                      msf=msf_client, kb=kb, verbose=True)
+    planner = Planner(
+        state=state,
+        runner=runner,
+        llm=llm,
+        msf=msf_client,
+        kb=kb,
+        verbose=True,
+        logger=log,
+        guard=guard,
+    )
 
     # ── Run ────────────────────────────────────────────────────────────────────
     print(f"{C.GREEN}{C.BOLD}[KIRA] Agent loop starting...{C.RESET}")
