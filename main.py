@@ -29,17 +29,28 @@ if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
 try:
-    from state       import StateManager
-    from llm         import LLMClient
-    from tool_runner import ToolRunner
-    from findings    import KnowledgeBase
-    from planner     import Planner
-    from logger      import KiraLogger
-    from reporter    import ReportGenerator
+    from kira.state       import StateManager
+    from kira.llm         import LLMClient
+    from kira.tool_runner import ToolRunner
+    from kira.findings    import KnowledgeBase
+    from kira.planner     import Planner
+    from kira.logger      import KiraLogger
+    from kira.reporter    import ReportGenerator
 except ImportError as e:
-    print(f"[ERROR] Failed to import Kira module: {e}")
-    print("        Make sure you are running from the kira/ directory.")
-    sys.exit(1)
+    # Fallback for legacy execution contexts where modules are imported
+    # from a flat path.
+    try:
+        from state       import StateManager
+        from llm         import LLMClient
+        from tool_runner import ToolRunner
+        from findings    import KnowledgeBase
+        from planner     import Planner
+        from logger      import KiraLogger
+        from reporter    import ReportGenerator
+    except ImportError:
+        print(f"[ERROR] Failed to import Kira module: {e}")
+        print("        Run from the repository root with: python main.py ...")
+        sys.exit(1)
 
 _KB_AVAILABLE = True
 
