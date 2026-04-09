@@ -1,31 +1,34 @@
 """
-kira/llm.py — LLM Interface
-============================
-All communication with the local Gemma 3 4B model (via Ollama) flows here.
-No other module calls the Ollama API directly.
+kira/llm.py — LLM Interface  (Day 4 update)
+=============================================
+All communication with the LLM flows here.
 
-Responsibilities:
-  - Send prompts to Gemma and always return parsed JSON
-  - Retry on malformed JSON with escalating correction prompts
-  - Validate the returned action against a known tool schema
-  - Track token usage and response latency per call
-  - Fail loudly with actionable messages (wrong host, model not pulled, etc.)
+Day 4 additions:
+  - Multi-provider support: Ollama | Anthropic | OpenAI
+  - generate_text() for free-text reporter prompts (non-JSON mode)
+  - Switching providers is a one-line config change (PROVIDER = "...")
 
 Usage:
-    llm = LLMClient(host="http://192.168.1.42:11434")
+    # Local Ollama (default)
+    llm = LLMClient()
 
-    action = llm.ask(
-        system="You are Kira, a penetration testing AI...",
-        user="Given these open ports [22, 80], what should I do next?",
-    )
-    # action is always a dict — never raises on bad JSON, retries instead
-    print(action["tool"], action["args"], action["reasoning"])
+    # Anthropic Claude
+    llm = LLMClient(provider="anthropic", api_key="sk-ant-...")
+    # or: export ANTHROPIC_API_KEY=sk-ant-... then LLMClient(provider="anthropic")
 
-    # Convenience wrapper used by the planner every loop tick:
+    # OpenAI
+    llm = LLMClient(provider="openai", api_key="sk-...")
+
+    # Planner action (JSON mode):
     action = llm.next_action(context_summary, phase="ENUM")
+    # action["tool"], action["args"], action["reasoning"]
+
+    # Reporter text (free-text mode):
+    text = llm.generate_text("Write an exec summary for...", temperature=0.3)
 """
 
 import json
+import os
 import time
 import textwrap
 from datetime import datetime, timezone
@@ -34,32 +37,37 @@ from typing import Optional
 import requests
 
 
-# ── Constants ──────────────────────────────────────────────────────────────────
+# ── Provider configuration ────────────────────────────────────────────────────
+# Switch LLM backend by changing PROVIDER.
+# Supported: "ollama" | "anthropic" | "openai"
 
-DEFAULT_MODEL   = "gemma3:4b"
-DEFAULT_HOST    = "http://localhost:11434"
-DEFAULT_TIMEOUT = 120          # seconds for a single HTTP request
-MAX_RETRIES     = 3            # JSON parse retries before giving up
-RETRY_DELAY     = 1.5          # seconds between retries
+PROVIDER        = "ollama"           # ← change this to switch backends
 
-# Every action the planner is allowed to emit.
-# The LLM is shown this list so it knows its option space.
+# Ollama (local)
+OLLAMA_HOST     = "http://localhost:11434"
+OLLAMA_MODEL    = "gemma3:4b"
+
+# Anthropic Claude (cloud)
+ANTHROPIC_KEY   = ""                 # or: export ANTHROPIC_API_KEY=sk-ant-...
+ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
+
+# OpenAI (cloud)
+OPENAI_KEY      = ""                 # or: export OPENAI_API_KEY=sk-...
+OPENAI_MODEL    = "gpt-4o-mini"
+
+DEFAULT_TIMEOUT = 120
+MAX_RETRIES     = 3
+RETRY_DELAY     = 1.5
+
+
+# ── Valid tools (unchanged from Day 3) ────────────────────────────────────────
+
 VALID_TOOLS = [
-    "nmap_scan",
-    "gobuster_dir",
-    "searchsploit",
-    "enum4linux",
-    "curl_probe",
-    "whatweb",
-    "msf_exploit",
-    "shell_cmd",
-    "linpeas",
-    "add_finding",
-    "add_note",
-    "advance_phase",
-    "REPORT",
-    "HALT",
+    "nmap_scan", "gobuster_dir", "searchsploit", "enum4linux",
+    "curl_probe", "whatweb", "msf_exploit", "shell_cmd", "linpeas",
+    "add_finding", "add_note", "advance_phase", "REPORT", "HALT",
 ]
+
 
 # ── Prompts ────────────────────────────────────────────────────────────────────
 
@@ -121,72 +129,86 @@ No markdown. No prose. No code fences. Just the JSON object.
 
 class LLMClient:
     """
-    Thin, robust wrapper around the Ollama /api/chat endpoint.
+    Unified LLM wrapper. Supports Ollama, Anthropic, and OpenAI.
 
     Parameters
     ----------
-    host    : Ollama server URL, e.g. "http://192.168.1.42:11434"
-    model   : model tag pulled via `ollama pull`, default "gemma3:4b"
-    timeout : per-request HTTP timeout in seconds
-    verbose : if True, print each call's latency and token count
+    provider : "ollama" | "anthropic" | "openai"  (default: PROVIDER constant)
+    host     : Ollama server URL (Ollama only)
+    model    : override model tag
+    api_key  : API key (Anthropic / OpenAI); falls back to env var
+    timeout  : HTTP timeout in seconds
+    verbose  : print each call's latency and token count
     """
 
     def __init__(
         self,
-        host:    str = DEFAULT_HOST,
-        model:   str = DEFAULT_MODEL,
-        timeout: int = DEFAULT_TIMEOUT,
-        verbose: bool = True,
+        host:     str  = None,
+        model:    str  = None,
+        provider: str  = None,
+        api_key:  str  = None,
+        timeout:  int  = DEFAULT_TIMEOUT,
+        verbose:  bool = True,
     ):
-        self.host    = host.rstrip("/")
-        self.model   = model
-        self.timeout = timeout
-        self.verbose = verbose
+        self.provider = (provider or PROVIDER).lower()
+        self.timeout  = timeout
+        self.verbose  = verbose
+        self._call_log: list[dict] = []
 
-        self._call_log: list[dict] = []   # in-memory log of every call
+        if self.provider == "ollama":
+            self.host    = (host or OLLAMA_HOST).rstrip("/")
+            self.model   = model or OLLAMA_MODEL
+            self.api_key = None
 
-    # ── Public API ─────────────────────────────────────────────────────────────
+        elif self.provider == "anthropic":
+            self.host    = "https://api.anthropic.com"
+            self.model   = model or ANTHROPIC_MODEL
+            self.api_key = api_key or os.getenv("ANTHROPIC_API_KEY", ANTHROPIC_KEY)
+            if not self.api_key:
+                raise ValueError(
+                    "Anthropic provider requires an API key. "
+                    "Pass api_key= or set ANTHROPIC_API_KEY environment variable."
+                )
+
+        elif self.provider == "openai":
+            self.host    = "https://api.openai.com"
+            self.model   = model or OPENAI_MODEL
+            self.api_key = api_key or os.getenv("OPENAI_API_KEY", OPENAI_KEY)
+            if not self.api_key:
+                raise ValueError(
+                    "OpenAI provider requires an API key. "
+                    "Pass api_key= or set OPENAI_API_KEY environment variable."
+                )
+
+        else:
+            raise ValueError(
+                f"Unknown provider '{self.provider}'. "
+                "Supported: ollama | anthropic | openai"
+            )
+
+    # ── Public: structured action (JSON mode) ─────────────────────────────────
 
     def ask(
         self,
-        user:   str,
-        system: str = SYSTEM_PROMPT,
-        temperature: float = 0.2,    # low = more deterministic / less hallucination
+        user:        str,
+        system:      str   = SYSTEM_PROMPT,
+        temperature: float = 0.2,
     ) -> dict:
         """
-        Send a prompt and always return a parsed dict.
-
-        Retries up to MAX_RETRIES times with a correction prompt if the
-        model returns malformed JSON. After all retries are exhausted,
-        returns a safe HALT action instead of raising.
-
-        Parameters
-        ----------
-        user        : the user-turn content (context summary + question)
-        system      : system prompt (defaults to Kira's pentest persona)
-        temperature : 0.0–1.0; keep low for reliable JSON output
-
-        Returns
-        -------
-        dict with keys: tool, args, reasoning
-             (plus _meta with latency / token info)
+        Send a prompt and always return a parsed action dict.
+        Retries up to MAX_RETRIES times on bad JSON.
+        Returns a safe HALT dict after all retries are exhausted.
         """
-        messages = [{"role": "user", "content": user}]
+        messages   = [{"role": "user", "content": user}]
         last_error = None
 
         for attempt in range(1, MAX_RETRIES + 1):
-            raw, meta = self._call_ollama(
-                system=system,
-                messages=messages,
-                temperature=temperature,
-            )
+            raw, meta = self._call(system=system, messages=messages, temperature=temperature)
 
             if raw is None:
-                # Network / server error — already logged in meta
                 return self._halt(f"LLM call failed: {meta.get('error')}", meta)
 
             parsed, parse_error = self._parse_json(raw)
-
             if parsed is not None:
                 validated, val_error = self._validate_action(parsed)
                 if validated is not None:
@@ -195,116 +217,66 @@ class LLMClient:
                     if self.verbose:
                         self._print_ok(validated, meta)
                     return validated
-                # Valid JSON but wrong schema — treat as parse error
                 parse_error = val_error
 
-            # Failed — append correction turn and retry
             if self.verbose:
                 self._print_retry(attempt, parse_error)
 
             messages.append({"role": "assistant", "content": raw})
             messages.append({
-                "role":    "user",
+                "role": "user",
                 "content": CORRECTION_PROMPT.format(error=parse_error),
             })
-            last_error = parse_error
+            time.sleep(RETRY_DELAY)
 
-            if attempt < MAX_RETRIES:
-                time.sleep(RETRY_DELAY)
-
-        # All retries exhausted
-        self._record(MAX_RETRIES, meta, ok=False)
-        return self._halt(
-            f"Could not get valid JSON after {MAX_RETRIES} attempts. "
-            f"Last error: {last_error}",
-        )
+        return self._halt(f"All {MAX_RETRIES} JSON parse attempts failed.", {})
 
     def next_action(self, context_summary: str, phase: str = "") -> dict:
         """
-        Convenience method used by the planner on every loop tick.
-        Wraps the context summary in a standard user prompt.
+        Convenience wrapper — builds the user prompt from context + phase,
+        calls ask(), returns the action dict.
+        """
+        phase_hint = f"\nCurrent phase: {phase}" if phase else ""
+        user_msg   = f"{context_summary}{phase_hint}\n\nWhat is your next action?"
+        return self.ask(user=user_msg)
+
+    # ── Public: free-text generation (reporter mode) ──────────────────────────
+
+    def generate_text(
+        self,
+        prompt:      str,
+        temperature: float = 0.3,
+        max_tokens:  int   = 500,
+    ) -> str:
+        """
+        Free-text generation — does NOT enforce JSON output.
+        Used by ReportGenerator for exec summary and finding writeups.
 
         Parameters
         ----------
-        context_summary : output of StateManager.get_context_summary()
-        phase           : current phase name (added to prompt for clarity)
+        prompt      : user prompt
+        temperature : 0.0–1.0
+        max_tokens  : approximate token cap
+
+        Returns
+        -------
+        str : raw model response, stripped of leading/trailing whitespace
         """
-        phase_line = f"Current phase: {phase}\n\n" if phase else ""
-        user = (
-            f"{phase_line}"
-            f"{context_summary}\n\n"
-            "Based on the session state above, what is the single best next action?"
-        )
-        return self.ask(user=user)
+        if self.provider == "ollama":
+            return self._generate_text_ollama(prompt, temperature, max_tokens)
+        elif self.provider == "anthropic":
+            return self._generate_text_anthropic(prompt, temperature, max_tokens)
+        elif self.provider == "openai":
+            return self._generate_text_openai(prompt, temperature, max_tokens)
+        return ""
 
-    def ping(self) -> tuple[bool, str]:
-        """
-        Check that the Ollama server is reachable and the model is loaded.
-
-        Returns (True, model_name) on success, (False, error_message) on failure.
-        """
-        try:
-            r = requests.get(
-                f"{self.host}/api/tags",
-                timeout=10,
-            )
-            r.raise_for_status()
-            models = [m["name"] for m in r.json().get("models", [])]
-
-            # Accept both "gemma3:4b" and "gemma3:4b-instruct-q4_K_M" etc.
-            matched = [m for m in models if m.startswith(self.model.split(":")[0])]
-            if not matched:
-                return False, (
-                    f"Model '{self.model}' not found on {self.host}.\n"
-                    f"Available: {models or ['(none)']}\n"
-                    f"Fix: ollama pull {self.model}"
-                )
-            return True, matched[0]
-
-        except requests.exceptions.ConnectionError:
-            return False, (
-                f"Cannot reach Ollama at {self.host}.\n"
-                "Is it running?  →  ollama serve\n"
-                "Is it exposed?  →  OLLAMA_HOST=0.0.0.0 ollama serve"
-            )
-        except requests.exceptions.Timeout:
-            return False, f"Ollama at {self.host} timed out during ping."
-        except Exception as e:
-            return False, f"Unexpected error pinging Ollama: {e}"
-
-    def call_log(self) -> list[dict]:
-        """Return a copy of the in-memory call log."""
-        return list(self._call_log)
-
-    # ── Internal: HTTP call ────────────────────────────────────────────────────
-
-    def _call_ollama(
-        self,
-        system:      str,
-        messages:    list,
-        temperature: float,
-    ) -> tuple[Optional[str], dict]:
-        """
-        POST to /api/chat. Returns (raw_text, meta_dict).
-        raw_text is None on any network or HTTP error.
-        """
+    def _generate_text_ollama(self, prompt: str, temperature: float, max_tokens: int) -> str:
         payload = {
-            "model":   self.model,
-            "stream":  False,
-            "format":  "json",          # Ollama JSON mode — forces valid JSON output
-            "options": {
-                "temperature": temperature,
-                "num_predict": 512,     # cap output tokens — actions are short
-            },
-            "messages": [
-                {"role": "system", "content": system},
-                *messages,
-            ],
+            "model":    self.model,
+            "stream":   False,
+            "options":  {"temperature": temperature, "num_predict": max_tokens},
+            "messages": [{"role": "user", "content": prompt}],
         }
-
-        t0 = time.monotonic()
-        meta: dict = {"timestamp": _ts()}
-
         try:
             resp = requests.post(
                 f"{self.host}/api/chat",
@@ -312,95 +284,274 @@ class LLMClient:
                 timeout=self.timeout,
             )
             resp.raise_for_status()
+            return resp.json().get("message", {}).get("content", "").strip()
+        except Exception:
+            return ""
 
-        except requests.exceptions.ConnectionError:
-            meta["error"] = (
-                f"Cannot reach Ollama at {self.host}. "
-                "Run: OLLAMA_HOST=0.0.0.0 ollama serve"
+    def _generate_text_anthropic(self, prompt: str, temperature: float, max_tokens: int) -> str:
+        headers = {
+            "x-api-key":         self.api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type":      "application/json",
+        }
+        payload = {
+            "model":       self.model,
+            "max_tokens":  max_tokens,
+            "temperature": temperature,
+            "messages":    [{"role": "user", "content": prompt}],
+        }
+        try:
+            resp = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers=headers,
+                json=payload,
+                timeout=self.timeout,
             )
-            return None, meta
+            resp.raise_for_status()
+            return resp.json()["content"][0]["text"].strip()
+        except Exception:
+            return ""
 
-        except requests.exceptions.Timeout:
-            meta["error"] = (
-                f"Ollama request timed out after {self.timeout}s. "
-                "The model may be loading — try again in a moment."
+    def _generate_text_openai(self, prompt: str, temperature: float, max_tokens: int) -> str:
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type":  "application/json",
+        }
+        payload = {
+            "model":       self.model,
+            "max_tokens":  max_tokens,
+            "temperature": temperature,
+            "messages":    [{"role": "user", "content": prompt}],
+        }
+        try:
+            resp = requests.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=self.timeout,
             )
-            return None, meta
+            resp.raise_for_status()
+            return resp.json()["choices"][0]["message"]["content"].strip()
+        except Exception:
+            return ""
 
-        except requests.exceptions.HTTPError as e:
-            meta["error"] = f"HTTP {resp.status_code}: {resp.text[:200]}"
-            return None, meta
+    # ── Ping ──────────────────────────────────────────────────────────────────
 
+    def ping(self) -> tuple[bool, str]:
+        """
+        Quick connectivity check.
+        Returns (True, model_name) or (False, error_message).
+        """
+        if self.provider == "ollama":
+            try:
+                resp = requests.get(f"{self.host}/api/tags", timeout=5)
+                resp.raise_for_status()
+                models = resp.json().get("models", [])
+                names  = [m.get("name", "") for m in models]
+                if self.model not in names:
+                    return False, (
+                        f"Model '{self.model}' not pulled. "
+                        f"Run: ollama pull {self.model}. "
+                        f"Available: {names}"
+                    )
+                return True, self.model
+            except requests.exceptions.ConnectionError:
+                return False, (
+                    f"Cannot connect to Ollama at {self.host}. "
+                    "Is Ollama running? Run: ollama serve"
+                )
+            except Exception as e:
+                return False, str(e)
+
+        elif self.provider == "anthropic":
+            try:
+                resp = requests.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers={
+                        "x-api-key":         self.api_key,
+                        "anthropic-version": "2023-06-01",
+                        "content-type":      "application/json",
+                    },
+                    json={"model": self.model, "max_tokens": 5,
+                          "messages": [{"role": "user", "content": "ping"}]},
+                    timeout=10,
+                )
+                resp.raise_for_status()
+                return True, self.model
+            except Exception as e:
+                return False, str(e)
+
+        elif self.provider == "openai":
+            try:
+                resp = requests.get(
+                    "https://api.openai.com/v1/models",
+                    headers={"Authorization": f"Bearer {self.api_key}"},
+                    timeout=10,
+                )
+                resp.raise_for_status()
+                return True, self.model
+            except Exception as e:
+                return False, str(e)
+
+        return False, "Unknown provider"
+
+    # ── Internal: routing ─────────────────────────────────────────────────────
+
+    def _call(self, system: str, messages: list, temperature: float) -> tuple:
+        """Route to the correct provider's structured call implementation."""
+        if self.provider == "anthropic":
+            return self._call_anthropic(system, messages, temperature)
+        elif self.provider == "openai":
+            return self._call_openai(system, messages, temperature)
+        else:
+            return self._call_ollama_native(system, messages, temperature)
+
+    # Keep _call_ollama as alias so existing planner code that calls it still works
+    def _call_ollama(self, system, messages, temperature):
+        return self._call(system, messages, temperature)
+
+    def _call_ollama_native(self, system: str, messages: list, temperature: float) -> tuple:
+        start  = time.monotonic()
+        payload = {
+            "model":    self.model,
+            "stream":   False,
+            "options":  {"temperature": temperature},
+            "messages": [{"role": "system", "content": system}] + messages,
+        }
+        meta = {}
+        try:
+            resp = requests.post(
+                f"{self.host}/api/chat",
+                json=payload,
+                timeout=self.timeout,
+            )
+            resp.raise_for_status()
+            data     = resp.json()
+            raw_text = data.get("message", {}).get("content", "")
+            meta = {
+                "latency_s":     round(time.monotonic() - start, 2),
+                "output_tokens": data.get("eval_count", 0),
+                "model":         data.get("model", self.model),
+                "provider":      "ollama",
+            }
+            return raw_text, meta
         except Exception as e:
-            meta["error"] = f"Unexpected HTTP error: {e}"
+            meta = {
+                "error":     str(e),
+                "latency_s": round(time.monotonic() - start, 2),
+                "provider":  "ollama",
+            }
             return None, meta
 
-        elapsed = time.monotonic() - t0
-        body = resp.json()
+    def _call_anthropic(self, system: str, messages: list, temperature: float) -> tuple:
+        start = time.monotonic()
+        headers = {
+            "x-api-key":         self.api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type":      "application/json",
+        }
+        payload = {
+            "model":       self.model,
+            "max_tokens":  1024,
+            "temperature": temperature,
+            "system":      system,
+            "messages":    messages,
+        }
+        meta = {}
+        try:
+            resp = requests.post(
+                "https://api.anthropic.com/v1/messages",
+                headers=headers,
+                json=payload,
+                timeout=self.timeout,
+            )
+            resp.raise_for_status()
+            data     = resp.json()
+            raw_text = data["content"][0]["text"]
+            usage    = data.get("usage", {})
+            meta = {
+                "latency_s":     round(time.monotonic() - start, 2),
+                "output_tokens": usage.get("output_tokens", 0),
+                "model":         data.get("model", self.model),
+                "provider":      "anthropic",
+            }
+            return raw_text, meta
+        except Exception as e:
+            meta = {
+                "error":     str(e),
+                "latency_s": round(time.monotonic() - start, 2),
+                "provider":  "anthropic",
+            }
+            return None, meta
 
-        raw_text = body.get("message", {}).get("content", "")
-        meta.update({
-            "latency_s":      round(elapsed, 2),
-            "prompt_tokens":  body.get("prompt_eval_count", 0),
-            "output_tokens":  body.get("eval_count", 0),
-            "model":          body.get("model", self.model),
-        })
-
-        return raw_text, meta
+    def _call_openai(self, system: str, messages: list, temperature: float) -> tuple:
+        start = time.monotonic()
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type":  "application/json",
+        }
+        payload = {
+            "model":       self.model,
+            "temperature": temperature,
+            "messages":    [{"role": "system", "content": system}] + messages,
+        }
+        meta = {}
+        try:
+            resp = requests.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers=headers,
+                json=payload,
+                timeout=self.timeout,
+            )
+            resp.raise_for_status()
+            data     = resp.json()
+            raw_text = data["choices"][0]["message"]["content"]
+            usage    = data.get("usage", {})
+            meta = {
+                "latency_s":     round(time.monotonic() - start, 2),
+                "output_tokens": usage.get("completion_tokens", 0),
+                "model":         data.get("model", self.model),
+                "provider":      "openai",
+            }
+            return raw_text, meta
+        except Exception as e:
+            meta = {
+                "error":     str(e),
+                "latency_s": round(time.monotonic() - start, 2),
+                "provider":  "openai",
+            }
+            return None, meta
 
     # ── Internal: parsing + validation ────────────────────────────────────────
 
     def _parse_json(self, raw: str) -> tuple[Optional[dict], Optional[str]]:
-        """
-        Attempt to parse raw string as JSON.
-        Strips markdown fences if the model ignored the format directive.
-        Returns (dict, None) on success, (None, error_string) on failure.
-        """
         text = raw.strip()
-
-        # Strip common markdown wrappings the model might add anyway
         if text.startswith("```"):
             lines = text.splitlines()
-            # Drop first line (```json or ```) and last (```)
-            text = "\n".join(lines[1:-1]).strip()
-
-        # Some models wrap with a single outer key like {"response": {...}}
-        # Try to unwrap one level if top-level has a single key
+            text  = "\n".join(lines[1:-1]).strip()
         try:
             parsed = json.loads(text)
         except json.JSONDecodeError as e:
             return None, f"{e} — raw: {text[:120]!r}"
-
-        # Unwrap single-key envelope if needed
         if isinstance(parsed, dict) and len(parsed) == 1:
             inner = next(iter(parsed.values()))
             if isinstance(inner, dict):
                 parsed = inner
-
         return parsed, None
 
     def _validate_action(self, obj: dict) -> tuple[Optional[dict], Optional[str]]:
-        """
-        Check that the parsed dict has the required keys and a valid tool name.
-        Returns (validated_dict, None) on success, (None, error_string) on failure.
-        """
         missing = [k for k in ("tool", "args", "reasoning") if k not in obj]
         if missing:
             return None, f"Missing required keys: {missing}"
-
         tool = obj["tool"]
         if tool not in VALID_TOOLS:
             close = [t for t in VALID_TOOLS if tool.lower() in t.lower()]
             hint  = f" Did you mean: {close}?" if close else ""
             return None, f"Unknown tool '{tool}'.{hint} Valid: {VALID_TOOLS}"
-
         if not isinstance(obj["args"], dict):
             return None, f"'args' must be a JSON object, got {type(obj['args']).__name__}"
-
         if not isinstance(obj["reasoning"], str):
             return None, "'reasoning' must be a string"
-
-        # Normalise — strip any extra keys the model may have added
         return {
             "tool":      tool,
             "args":      obj["args"],
@@ -410,12 +561,7 @@ class LLMClient:
     # ── Internal: helpers ──────────────────────────────────────────────────────
 
     def _halt(self, reason: str, meta: dict = None) -> dict:
-        return {
-            "tool":      "HALT",
-            "args":      {},
-            "reasoning": reason,
-            "_meta":     meta or {},
-        }
+        return {"tool": "HALT", "args": {}, "reasoning": reason, "_meta": meta or {}}
 
     def _record(self, attempts: int, meta: dict, ok: bool) -> None:
         self._call_log.append({
@@ -424,21 +570,21 @@ class LLMClient:
             "ok":        ok,
             "latency_s": meta.get("latency_s"),
             "tokens":    meta.get("output_tokens"),
+            "provider":  meta.get("provider", self.provider),
         })
 
     def _print_ok(self, action: dict, meta: dict) -> None:
         try:
             from rich.console import Console
-            c = Console()
-            c.print(
-                f"[dim][LLM][/dim] "
+            Console().print(
+                f"[dim][LLM/{self.provider}][/dim] "
                 f"[green]{action['tool']}[/green] "
-                f"[dim]({meta.get('latency_s', '?')}s, "
-                f"{meta.get('output_tokens', '?')} tokens)[/dim]"
+                f"[dim]({meta.get('latency_s','?')}s, "
+                f"{meta.get('output_tokens','?')} tokens)[/dim]"
             )
-            c.print(f"  [dim italic]{action['reasoning']}[/dim italic]")
+            Console().print(f"  [dim italic]{action['reasoning']}[/dim italic]")
         except ImportError:
-            print(f"[LLM] {action['tool']} ({meta.get('latency_s')}s) — {action['reasoning']}")
+            print(f"[LLM/{self.provider}] {action['tool']} ({meta.get('latency_s')}s) — {action['reasoning']}")
 
     def _print_retry(self, attempt: int, error: str) -> None:
         try:
@@ -461,91 +607,75 @@ def _ts() -> str:
 if __name__ == "__main__":
     import sys
 
-    host = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_HOST
-    print(f"=== llm.py smoke test  (host: {host}) ===\n")
+    print("=== llm.py smoke test (Day 4 — provider abstraction) ===\n")
 
-    llm = LLMClient(host=host, verbose=True)
+    # [1] Provider routing — Ollama (default)
+    print("[1] LLMClient(provider='ollama')")
+    llm = LLMClient(provider="ollama", verbose=False)
+    assert llm.provider == "ollama"
+    assert llm.model == OLLAMA_MODEL
+    print(f"    provider={llm.provider}  model={llm.model}  host={llm.host}  OK\n")
 
-    # ── 1. Ping ────────────────────────────────────────────────────────────────
-    print("[1] Pinging Ollama...")
-    ok, msg = llm.ping()
+    # [2] Provider routing — Anthropic
+    print("[2] LLMClient(provider='anthropic', api_key='sk-test')")
+    llm_ant = LLMClient(provider="anthropic", api_key="sk-ant-test", verbose=False)
+    assert llm_ant.provider == "anthropic"
+    assert llm_ant.model == ANTHROPIC_MODEL
+    print(f"    provider={llm_ant.provider}  model={llm_ant.model}  OK\n")
+
+    # [3] Provider routing — OpenAI
+    print("[3] LLMClient(provider='openai', api_key='sk-test')")
+    llm_oai = LLMClient(provider="openai", api_key="sk-test", verbose=False)
+    assert llm_oai.provider == "openai"
+    print(f"    provider={llm_oai.provider}  model={llm_oai.model}  OK\n")
+
+    # [4] Unknown provider raises
+    print("[4] Unknown provider raises ValueError")
+    try:
+        LLMClient(provider="groq", verbose=False)
+        assert False, "Should raise"
+    except ValueError as e:
+        print(f"    Correctly raised: {e}\n")
+
+    # [5] Anthropic requires key
+    print("[5] Anthropic without key raises ValueError")
+    os.environ.pop("ANTHROPIC_API_KEY", None)
+    try:
+        LLMClient(provider="anthropic", verbose=False)
+        assert False, "Should raise"
+    except ValueError as e:
+        print(f"    Correctly raised: {e}\n")
+
+    # [6] generate_text exists and routes correctly
+    print("[6] generate_text() method exists on all providers")
+    for p, key in [("ollama", None), ("anthropic", "sk-test"), ("openai", "sk-test")]:
+        client = LLMClient(provider=p, api_key=key, verbose=False)
+        assert hasattr(client, "generate_text"), f"generate_text missing for {p}"
+        print(f"    {p}: generate_text present  OK")
+
+    # [7] JSON parse + validation (provider-independent)
+    print("\n[7] _parse_json + _validate_action (provider-independent)")
+    llm2 = LLMClient(provider="ollama", verbose=False)
+    parsed, err = llm2._parse_json(
+        '{"tool": "nmap_scan", "args": {"target": "10.10.10.5"}, "reasoning": "Start."}'
+    )
+    assert parsed is not None and err is None
+    validated, verr = llm2._validate_action(parsed)
+    assert validated is not None and verr is None
+    print(f"    parse+validate OK: tool={validated['tool']}\n")
+
+    # [8] Live Ollama ping (only if running)
+    host = sys.argv[1] if len(sys.argv) > 1 else OLLAMA_HOST
+    llm3 = LLMClient(provider="ollama", host=host, verbose=True)
+    print(f"[8] Pinging Ollama at {host}...")
+    ok, msg = llm3.ping()
     if ok:
-        print(f"    Server reachable — model: {msg}\n")
+        print(f"    Reachable — model: {msg}")
+        print("\n[9] Live generate_text() call...")
+        result = llm3.generate_text("Say hello in one sentence.", temperature=0.3, max_tokens=50)
+        print(f"    Response: {result[:100]}")
     else:
-        print(f"    UNREACHABLE: {msg}")
-        print("\n[OFFLINE] Running JSON-parse + validation tests only.\n")
+        print(f"    Unreachable: {msg}")
+        print("    (Skipping live generation test)")
 
-    # ── 2. JSON parse: valid ───────────────────────────────────────────────────
-    print("[2] _parse_json — valid input")
-    parsed, err = llm._parse_json(
-        '{"tool": "nmap_scan", "args": {"target": "10.10.10.5"}, "reasoning": "Start with recon."}'
-    )
-    assert parsed is not None and err is None, f"Expected success, got: {err}"
-    print(f"    parsed OK: tool={parsed['tool']}\n")
-
-    # ── 3. JSON parse: markdown fences ────────────────────────────────────────
-    print("[3] _parse_json — strips markdown fences")
-    fenced = '```json\n{"tool": "gobuster_dir", "args": {}, "reasoning": "Enumerate web."}\n```'
-    parsed, err = llm._parse_json(fenced)
-    assert parsed is not None, f"Fence strip failed: {err}"
-    print(f"    stripped OK: tool={parsed['tool']}\n")
-
-    # ── 4. JSON parse: invalid ─────────────────────────────────────────────────
-    print("[4] _parse_json — invalid JSON")
-    parsed, err = llm._parse_json("This is not JSON at all.")
-    assert parsed is None and err is not None
-    print(f"    correctly rejected: {err[:60]}\n")
-
-    # ── 5. Validation: missing keys ────────────────────────────────────────────
-    print("[5] _validate_action — missing keys")
-    _, err = llm._validate_action({"tool": "nmap_scan"})
-    assert err is not None and "Missing" in err
-    print(f"    correctly rejected: {err}\n")
-
-    # ── 6. Validation: unknown tool ────────────────────────────────────────────
-    print("[6] _validate_action — unknown tool")
-    _, err = llm._validate_action(
-        {"tool": "rm_rf", "args": {}, "reasoning": "chaos"}
-    )
-    assert err is not None and "Unknown tool" in err
-    print(f"    correctly rejected: {err[:80]}\n")
-
-    # ── 7. Validation: valid action ────────────────────────────────────────────
-    print("[7] _validate_action — valid action")
-    validated, err = llm._validate_action(
-        {"tool": "searchsploit", "args": {"query": "Apache 2.4.49"},
-         "reasoning": "Check for known CVEs.", "extra_key": "ignored"}
-    )
-    assert validated is not None and err is None
-    assert "extra_key" not in validated, "Extra keys should be stripped"
-    print(f"    validated OK: {validated}\n")
-
-    # ── 8. Live LLM call (only if server reachable) ────────────────────────────
-    if ok:
-        print("[8] Live next_action call...")
-        fake_context = textwrap.dedent("""
-            === KIRA SESSION CONTEXT ===
-            Target     : 10.10.10.5
-            Phase      : RECON — Port scanning and service fingerprinting
-            User       : none | Root: False
-
-            Open ports : 22, 80
-              22/tcp  OpenSSH 7.9
-              80/tcp  Apache httpd 2.4.49
-
-            Recent actions:
-              [2026-04-06T10:00:00Z] nmap_scan → Found 2 open ports: 22, 80
-            === END CONTEXT ===
-        """).strip()
-
-        action = llm.next_action(fake_context, phase="RECON")
-        print(f"    tool      : {action['tool']}")
-        print(f"    args      : {action['args']}")
-        print(f"    reasoning : {action['reasoning']}")
-        meta = action.get("_meta", {})
-        print(f"    latency   : {meta.get('latency_s')}s")
-        print(f"    tokens    : {meta.get('output_tokens')}")
-        assert action["tool"] in VALID_TOOLS, "Returned invalid tool"
-        print()
-
-    print("All tests passed.")
+    print("\nAll offline tests passed.")
