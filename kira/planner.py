@@ -363,7 +363,8 @@ class Planner:
     def _do_nmap(self, args: dict, target: str) -> str:
         tgt   = args.get("target", target)
         flags = args.get("flags", "-sV -sC")
-        ports = args.get("ports")
+        # Enforce all-port scan when model omits ports.
+        ports = _normalize_ports_arg(args.get("ports")) or "-"
 
         result = self._runner.nmap(target=tgt, flags=flags, ports=ports)
 
@@ -395,7 +396,7 @@ class Planner:
         return result.summary
 
     def _do_gobuster(self, args: dict) -> str:
-        url      = args.get("url", f"http://{self._state.target}")
+        url      = args.get("url") or _default_http_url(self._state)
         wordlist = args.get(
             "wordlist",
             "/usr/share/wordlists/dirb/common.txt",
@@ -456,7 +457,7 @@ class Planner:
         return result.summary
 
     def _do_curl(self, args: dict) -> str:
-        url   = args.get("url", f"http://{self._state.target}")
+        url   = args.get("url") or _default_http_url(self._state)
         flags = args.get("flags", "-sI")
         result = self._runner.curl(url=url, flags=flags)
         if result.ok:
@@ -473,7 +474,7 @@ class Planner:
         return result.summary
 
     def _do_whatweb(self, args: dict) -> str:
-        url    = args.get("url", f"http://{self._state.target}")
+        url    = args.get("url") or _default_http_url(self._state)
         result = self._runner.whatweb(url=url)
         return result.summary
 
@@ -959,6 +960,50 @@ def _url_to_port(url: str) -> Optional[int]:
         return 443 if parsed.scheme == "https" else 80
     except Exception:
         return None
+
+
+def _normalize_ports_arg(ports: Optional[str]) -> Optional[str]:
+    """
+    Normalize LLM-provided ports argument.
+    Accepts values like "-p 80,443" and converts to "80,443".
+    """
+    if not ports:
+        return None
+    p = str(ports).strip()
+    if p.startswith("-p "):
+        return p[3:].strip()
+    if p.startswith("-p"):
+        return p[2:].strip()
+    return p
+
+
+def _default_http_url(state) -> str:
+    """
+    Build a sensible default URL from known open ports/services.
+    Falls back to http://<target>.
+    """
+    target = state.target or "127.0.0.1"
+    open_ports = list(state.get("open_ports") or [])
+
+    # Prefer standard web ports first.
+    for p in (80, 443, 8080, 8443, 8000, 8888, 55553):
+        if p in open_ports:
+            scheme = "https" if p == 443 else "http"
+            return f"{scheme}://{target}" if p in (80, 443) else f"{scheme}://{target}:{p}"
+
+    # Try to infer from service names.
+    services = dict(state.get("services") or {})
+    for p_str, svc in services.items():
+        svc_l = str(svc).lower()
+        if "http" in svc_l or "web" in svc_l:
+            try:
+                p = int(p_str)
+            except Exception:
+                continue
+            scheme = "https" if p == 443 else "http"
+            return f"{scheme}://{target}" if p in (80, 443) else f"{scheme}://{target}:{p}"
+
+    return f"http://{target}"
 
 
 # ── Smoke test ─────────────────────────────────────────────────────────────────

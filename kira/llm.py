@@ -45,7 +45,7 @@ PROVIDER        = "ollama"           # ← change this to switch backends
 
 # Ollama (local)
 OLLAMA_HOST     = "http://localhost:11434"
-OLLAMA_MODEL    = "qwen2.5-coder:14b-instruct-q4_K_M"
+OLLAMA_MODEL    = "gemma3:4b"
 
 # Anthropic Claude (cloud)
 ANTHROPIC_KEY   = ""                 # or: export ANTHROPIC_API_KEY=sk-ant-...
@@ -102,7 +102,7 @@ RULES:
 5. Only emit REPORT when you have at least one confirmed vulnerability finding.
 
 VALID TOOLS AND THEIR ARGS:
-  nmap_scan        : {"target": "IP", "flags": "-sV -sC", "ports": "22,80"}
+  nmap_scan        : {"target": "IP", "flags": "-sV -sC", "ports": "-"}
   gobuster_dir     : {"url": "http://IP", "wordlist": "/path/to/list.txt"}
   searchsploit     : {"query": "service version string"}
   enum4linux       : {"target": "IP"}

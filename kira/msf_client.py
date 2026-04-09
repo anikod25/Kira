@@ -232,8 +232,12 @@ class MSFClient:
 
             self.log.info(f"[MSF] Running {module} against {options.get('RHOSTS', '?')}")
             job    = mod.execute()
-            job_id = job.get("job_id")
-            uuid   = job.get("uuid", "")
+            if isinstance(job, dict):
+                job_id = job.get("job_id")
+                uuid   = job.get("uuid", "")
+            else:
+                job_id = None
+                uuid   = ""
             self.log.info(f"[MSF] Job started: id={job_id} uuid={uuid}")
 
             session_id = self._wait_for_session(uuid)
