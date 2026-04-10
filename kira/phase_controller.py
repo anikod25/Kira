@@ -15,7 +15,7 @@ Usage:
 PHASE_CRITERIA = {
     "RECON": {
         "complete_when": lambda s: len(s.get("open_ports", [])) > 0,
-        "focus": "Run nmap. Discover all open ports and service versions.",
+        "focus": "Run nmap on heavily used ports (22,25,53,443,3128,4443,4444,8090,8443) for service versions.",
         "allowed_tools": ["nmap_scan", "add_note"],
     },
     "ENUM": {

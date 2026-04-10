@@ -363,8 +363,8 @@ class Planner:
     def _do_nmap(self, args: dict, target: str) -> str:
         tgt   = args.get("target", target)
         flags = args.get("flags", "-sV -sC")
-        # Enforce all-port scan when model omits ports.
-        ports = _normalize_ports_arg(args.get("ports")) or "-"
+        # Default: heavily used ports only; pass ports="-" for full range.
+        ports = _normalize_ports_arg(args.get("ports")) or NMAP_HEAVY_PORTS
 
         result = self._runner.nmap(target=tgt, flags=flags, ports=ports)
 
@@ -960,6 +960,10 @@ def _url_to_port(url: str) -> Optional[int]:
         return 443 if parsed.scheme == "https" else 80
     except Exception:
         return None
+
+
+# ssh, smtp, domain, https, squid-http, pharos, krb524, opsmessaging, https-alt
+NMAP_HEAVY_PORTS = "22,25,53,443,3128,4443,4444,8090,8443"
 
 
 def _normalize_ports_arg(ports: Optional[str]) -> Optional[str]:

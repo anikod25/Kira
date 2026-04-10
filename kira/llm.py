@@ -102,7 +102,7 @@ RULES:
 5. Only emit REPORT when you have at least one confirmed vulnerability finding.
 
 VALID TOOLS AND THEIR ARGS:
-  nmap_scan        : {"target": "IP", "flags": "-sV -sC", "ports": "-"}
+  nmap_scan        : {"target": "IP", "flags": "-sV -sC", "ports": "22,25,53,443,3128,4443,4444,8090,8443 (default if omitted); \"-\" for all ports"}
   gobuster_dir     : {"url": "http://IP", "wordlist": "/path/to/list.txt"}
   searchsploit     : {"query": "service version string"}
   enum4linux       : {"target": "IP"}
