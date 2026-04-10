@@ -417,8 +417,8 @@ def _build_parser() -> argparse.ArgumentParser:
     # Session
     parser.add_argument("--session-dir", default=None,
                         help="Custom session directory (auto-generated if not set)")
-    parser.add_argument("--max-iter", type=int, default=10, metavar="N",
-                        help="Maximum planner loop iterations (default: 10)")
+    parser.add_argument("--max-iter", type=int, default=20, metavar="N",
+                        help="Maximum planner loop iterations (default: 20)")
 
     msf = parser.add_argument_group("Metasploit RPC (optional)")
     msf.add_argument("--no-msf", action="store_true",
