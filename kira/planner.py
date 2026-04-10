@@ -396,7 +396,10 @@ class Planner:
         return result.summary
 
     def _do_gobuster(self, args: dict) -> str:
-        url      = args.get("url") or _default_http_url(self._state)
+        url      = _normalize_http_tool_url(
+            args.get("url") or _default_http_url(self._state),
+            self._state,
+        )
         wordlist = args.get(
             "wordlist",
             "/usr/share/wordlists/dirb/common.txt",
@@ -457,7 +460,10 @@ class Planner:
         return result.summary
 
     def _do_curl(self, args: dict) -> str:
-        url   = args.get("url") or _default_http_url(self._state)
+        url   = _normalize_http_tool_url(
+            args.get("url") or _default_http_url(self._state),
+            self._state,
+        )
         flags = args.get("flags", "-sI")
         result = self._runner.curl(url=url, flags=flags)
         if result.ok:
@@ -474,7 +480,10 @@ class Planner:
         return result.summary
 
     def _do_whatweb(self, args: dict) -> str:
-        url    = args.get("url") or _default_http_url(self._state)
+        url    = _normalize_http_tool_url(
+            args.get("url") or _default_http_url(self._state),
+            self._state,
+        )
         result = self._runner.whatweb(url=url)
         return result.summary
 
@@ -962,8 +971,85 @@ def _url_to_port(url: str) -> Optional[int]:
         return None
 
 
-# ssh, smtp, domain, https, squid-http, pharos, krb524, opsmessaging, https-alt
-NMAP_HEAVY_PORTS = "22,25,53,443,3128,4443,4444,8090,8443"
+# ssh, smtp, domain, http, https, squid-http, pharos, krb524, opsmessaging, https-alt
+
+def _normalize_http_tool_url(url: str, state) -> str:
+    """
+    Fix URLs the model often gets wrong when the web app is not on :80/:443:
+      - http://host while only e.g. 8080 is open -> http://host:8080
+      - http://host/8080 (port in path) -> http://host:8080/
+    """
+    from urllib.parse import urlparse, urlunparse
+
+    raw = (url or "").strip()
+    if not raw:
+        return raw
+    try:
+        parsed = urlparse(raw)
+    except Exception:
+        return raw
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return raw
+
+    auth = ""
+    hostpart = parsed.netloc
+    if "@" in hostpart:
+        auth, hostpart = hostpart.split("@", 1)
+        auth = auth + "@"
+    host = hostpart.split(":")[0]
+    if not host:
+        return raw
+
+    open_ports = set(state.get("open_ports") or [])
+
+    if parsed.port is None and parsed.path not in ("", "/"):
+        rest = parsed.path.lstrip("/")
+        if rest:
+            first, _, remainder = rest.partition("/")
+            if first.isdigit():
+                port = int(first)
+                if 1 <= port <= 65535:
+                    new_path = "/" + remainder if remainder else "/"
+                    netloc = f"{auth}{host}:{port}"
+                    raw = urlunparse(
+                        (parsed.scheme, netloc, new_path, "", parsed.query, parsed.fragment)
+                    )
+                    parsed = urlparse(raw)
+
+    cur = _url_to_port(raw)
+    if not open_ports or cur in open_ports:
+        return raw
+
+    preference = (80, 443, 8080, 8443, 8000, 8888, 8090)
+    pick = next((hp for hp in preference if hp in open_ports), None)
+    if pick is None:
+        services = dict(state.get("services") or {})
+        for p_str, svc in services.items():
+            if not any(
+                k in str(svc).lower()
+                for k in ("http", "web", "apache", "nginx", "iis", "httpd")
+            ):
+                continue
+            try:
+                pi = int(p_str)
+            except ValueError:
+                continue
+            if pi in open_ports:
+                pick = pi
+                break
+    if pick is None:
+        return raw
+
+    scheme = "https" if pick in (443, 8443) else "http"
+    if pick in (80, 443):
+        netloc = f"{auth}{host}"
+    else:
+        netloc = f"{auth}{host}:{pick}"
+    pth = parsed.path if (parsed.path and parsed.path != "") else "/"
+    return urlunparse((scheme, netloc, pth, "", parsed.query, parsed.fragment))
+
+
+NMAP_HEAVY_PORTS = "22,25,53,80,443,8080,3128,4443,4444,8090,8443"
 
 
 def _normalize_ports_arg(ports: Optional[str]) -> Optional[str]:

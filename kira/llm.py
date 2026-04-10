@@ -102,12 +102,12 @@ RULES:
 5. Only emit REPORT when you have at least one confirmed vulnerability finding.
 
 VALID TOOLS AND THEIR ARGS:
-  nmap_scan        : {"target": "IP", "flags": "-sV -sC", "ports": "22,25,53,443,3128,4443,4444,8090,8443 (default if omitted); \"-\" for all ports"}
-  gobuster_dir     : {"url": "http://IP", "wordlist": "/path/to/list.txt"}
+  nmap_scan        : {"target": "IP", "flags": "-sV -sC", "ports": "22,25,53,80,443,8080,3128,4443,4444,8090,8443 (default if omitted); \"-\" for all ports"}
+  gobuster_dir     : {"url": "http://IP or http://IP:PORT (omit :80/:443 only)", "wordlist": "/path/to/list.txt"}
   searchsploit     : {"query": "service version string"}
   enum4linux       : {"target": "IP"}
-  curl_probe       : {"url": "http://IP/path", "flags": "-sI"}
-  whatweb          : {"url": "http://IP"}
+  curl_probe       : {"url": "http://IP:PORT/ (use :PORT when not 80/443)", "flags": "-sI"}
+  whatweb          : {"url": "http://IP:PORT/"}
   msf_exploit      : {"module": "exploit/...", "options": {"RHOSTS": "IP"}}
   shell_cmd        : {"cmd": "whoami", "session_id": 1}
   linpeas          : {"session_id": 1}
