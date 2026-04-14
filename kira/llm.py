@@ -39,7 +39,7 @@ import requests
 
 # ── Provider configuration ────────────────────────────────────────────────────
 # Switch LLM backend by changing PROVIDER.
-# Supported: "ollama" | "anthropic" | "openai"
+# Supported: "ollama" | "anthropic" | "openai" | "gemini"
 
 PROVIDER        = "ollama"           # ← change this to switch backends
 
@@ -54,6 +54,13 @@ ANTHROPIC_MODEL = "claude-haiku-4-5-20251001"
 # OpenAI (cloud)
 OPENAI_KEY      = ""                 # or: export OPENAI_API_KEY=sk-...
 OPENAI_MODEL    = "gpt-4o-mini"
+
+# Google Gemini — Vertex AI (cloud)
+# Get key from your GCP project. Set GEMINI_PROJECT to your project ID.
+GEMINI_KEY      = ""                 # or: export GEMINI_API_KEY=AIza...
+GEMINI_MODEL    = "gemini-2.0-flash"
+GEMINI_PROJECT  = ""                 # or: export GEMINI_PROJECT=csi-kira
+GEMINI_LOCATION = "us-central1"      # or: export GEMINI_LOCATION=us-central1
 
 DEFAULT_TIMEOUT = 120
 MAX_RETRIES     = 3
@@ -75,7 +82,7 @@ DEFAULT_TEMPERATURE = 0.2
 
 VALID_TOOLS = [
     "nmap_scan", "gobuster_dir", "searchsploit", "enum4linux",
-    "curl_probe", "whatweb", "msf_exploit", "shell_cmd", "linpeas",
+    "curl_probe", "whatweb", "msf_search", "msf_exploit", "shell_cmd", "linpeas",
     "add_finding", "add_note", "advance_phase", "REPORT", "HALT",
 ]
 
@@ -188,10 +195,27 @@ class LLMClient:
                     "Pass api_key= or set OPENAI_API_KEY environment variable."
                 )
 
+        elif self.provider == "gemini":
+            self.model    = model or GEMINI_MODEL
+            self.api_key  = api_key or os.getenv("GEMINI_API_KEY", GEMINI_KEY)
+            self.project  = os.getenv("GEMINI_PROJECT", GEMINI_PROJECT)
+            self.location = os.getenv("GEMINI_LOCATION", GEMINI_LOCATION)
+            if not self.api_key:
+                raise ValueError(
+                    "Gemini provider requires an API key. "
+                    "Pass api_key= or set GEMINI_API_KEY environment variable."
+                )
+            # Vertex AI endpoint
+            self.host = (
+                f"https://{self.location}-aiplatform.googleapis.com/v1"
+                f"/projects/{self.project}/locations/{self.location}"
+                f"/publishers/google/models"
+            ) if self.project else "https://generativelanguage.googleapis.com"
+
         else:
             raise ValueError(
                 f"Unknown provider '{self.provider}'. "
-                "Supported: ollama | anthropic | openai"
+                "Supported: ollama | anthropic | openai | gemini"
             )
 
     # ── Public: structured action (JSON mode) ─────────────────────────────────
@@ -277,6 +301,8 @@ class LLMClient:
             return self._generate_text_anthropic(prompt, temperature, max_tokens)
         elif self.provider == "openai":
             return self._generate_text_openai(prompt, temperature, max_tokens)
+        elif self.provider == "gemini":
+            return self._generate_text_gemini(prompt, temperature, max_tokens)
         return ""
 
     def _generate_text_ollama(self, prompt: str, temperature: float, max_tokens: int) -> str:
@@ -402,6 +428,26 @@ class LLMClient:
             except Exception as e:
                 return False, str(e)
 
+        elif self.provider == "gemini":
+            for attempt in range(3):
+                try:
+                    resp = requests.post(
+                        self._gemini_url(),
+                        headers=self._gemini_headers(),
+                        json={"contents": [{"parts": [{"text": "ping"}]}]},
+                        timeout=10,
+                    )
+                    if resp.status_code == 429:
+                        time.sleep(2 ** attempt)
+                        continue
+                    resp.raise_for_status()
+                    return True, self.model
+                except Exception as e:
+                    if attempt == 2:
+                        return False, str(e)
+                    time.sleep(2 ** attempt)
+            return True, f"{self.model} (ping rate limited — key valid)"
+
         return False, "Unknown provider"
 
     # ── Internal: routing ─────────────────────────────────────────────────────
@@ -412,6 +458,8 @@ class LLMClient:
             return self._call_anthropic(system, messages, temperature)
         elif self.provider == "openai":
             return self._call_openai(system, messages, temperature)
+        elif self.provider == "gemini":
+            return self._call_gemini(system, messages, temperature)
         else:
             return self._call_ollama_native(system, messages, temperature)
 
@@ -530,6 +578,97 @@ class LLMClient:
                 "provider":  "openai",
             }
             return None, meta
+
+    # ── Gemini helpers ────────────────────────────────────────────────────────
+
+    def _gemini_url(self) -> str:
+        """Build the correct Gemini endpoint — Vertex AI if project set, else standard."""
+        if getattr(self, "project", ""):
+            loc = getattr(self, "location", "us-central1")
+            return (
+                f"https://{loc}-aiplatform.googleapis.com/v1"
+                f"/projects/{self.project}/locations/{loc}"
+                f"/publishers/google/models/{self.model}:generateContent"
+            )
+        return (
+            f"https://generativelanguage.googleapis.com"
+            f"/v1beta/models/{self.model}:generateContent"
+            f"?key={self.api_key}"
+        )
+
+    def _gemini_headers(self) -> dict:
+        """Auth headers — Bearer token for Vertex AI, empty for standard API key."""
+        if getattr(self, "project", ""):
+            return {
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type":  "application/json",
+            }
+        return {"Content-Type": "application/json"}
+
+    def _call_gemini(self, system: str, messages: list, temperature: float) -> tuple:
+        start = time.monotonic()
+        contents = [
+            {"role": "user",  "parts": [{"text": system}]},
+            {"role": "model", "parts": [{"text": "Understood. I will reply with only raw JSON."}]},
+        ]
+        for msg in messages:
+            role = "model" if msg["role"] == "assistant" else "user"
+            contents.append({"role": role, "parts": [{"text": msg["content"]}]})
+
+        payload = {
+            "contents": contents,
+            "generationConfig": {
+                "temperature":      temperature,
+                "maxOutputTokens":  512,
+                "responseMimeType": "application/json",
+            },
+        }
+        meta = {}
+        try:
+            resp = requests.post(
+                self._gemini_url(),
+                headers=self._gemini_headers(),
+                json=payload,
+                timeout=self.timeout,
+            )
+            resp.raise_for_status()
+            data     = resp.json()
+            raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
+            usage    = data.get("usageMetadata", {})
+            meta = {
+                "latency_s":     round(time.monotonic() - start, 2),
+                "output_tokens": usage.get("candidatesTokenCount", 0),
+                "model":         self.model,
+                "provider":      "gemini",
+            }
+            return raw_text, meta
+        except Exception as e:
+            meta = {
+                "error":     str(e),
+                "latency_s": round(time.monotonic() - start, 2),
+                "provider":  "gemini",
+            }
+            return None, meta
+
+    def _generate_text_gemini(self, prompt: str, temperature: float, max_tokens: int) -> str:
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "temperature":     temperature,
+                "maxOutputTokens": max_tokens,
+            },
+        }
+        try:
+            resp = requests.post(
+                self._gemini_url(),
+                headers=self._gemini_headers(),
+                json=payload,
+                timeout=self.timeout,
+            )
+            resp.raise_for_status()
+            return resp.json()["candidates"][0]["content"]["parts"][0]["text"].strip()
+        except Exception:
+            return ""
 
     # ── Internal: parsing + validation ────────────────────────────────────────
 
