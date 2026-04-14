@@ -20,7 +20,7 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
-This project uses the Gemma model by Google.
+This project uses the Gemma 3 4B model by Google.
 
 Gemma is licensed under its own terms:
 https://ai.google.dev/gemma/terms
