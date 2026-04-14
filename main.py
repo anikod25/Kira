@@ -6,7 +6,7 @@ Start without arguments and interact conversationally:
   - Chat with Kira (ask security questions)
   - Tell Kira to scan a target (e.g., "Find vulnerabilities on 10.10.10.5")
   - Get results interactively
-Uses Google Gemini LLM (configure via GOOGLE_API_KEY environment variable).
+Uses a local Ollama LLM (configure via OLLAMA_HOST / OLLAMA_MODEL env vars).
 
 Usage:
     python main.py
@@ -165,9 +165,11 @@ def _make_session_dir(target: str, custom: str = None) -> Path:
 # ── LLM factory ───────────────────────────────────────────────────────────────
 
 def build_llm(args, verbose: bool) -> LLMClient:
-    """Construct LLMClient from env variable. Prints clear error on failure."""
+    """Construct Ollama LLMClient from CLI args and env vars."""
+    host  = getattr(args, "ollama_host", None) or os.getenv("OLLAMA_HOST", "http://localhost:11434")
+    model = getattr(args, "model", None)        or os.getenv("OLLAMA_MODEL", "gemma3:4b")
     try:
-        return LLMClient(verbose=verbose)
+        return LLMClient(host=host, model=model, verbose=verbose)
     except ValueError as e:
         _die(str(e))
 
@@ -379,7 +381,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "  python main.py --session-dir ./my_session\n"
             "\n"
             "  [!] Chat with Kira to set targets and trigger scans.\n"
-            "  [!] Set GOOGLE_API_KEY environment variable before running."
+            "  [!] Set OLLAMA_HOST in .env if Ollama is not on localhost."
         ),
     )
 
@@ -389,9 +391,13 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--authorized-by", default="Lab VM", metavar="AUTHORIZATION",
                         help="Authorization identifier (default: 'Lab VM')")
 
-    # LLM (Gemini)
+    # LLM (Ollama)
+    parser.add_argument("--ollama-host",
+                        default=os.getenv("OLLAMA_HOST", "http://localhost:11434"),
+                        metavar="URL",
+                        help="Ollama base URL (default: http://localhost:11434)")
     parser.add_argument("--model", default=None,
-                        help="Override Gemini model name")
+                        help="Override Ollama model tag (default: gemma3:4b)")
 
     # Session
     parser.add_argument("--session-dir", default=None,
@@ -450,7 +456,8 @@ def main():
 
     # ── Startup info ───────────────────────────────────────────────────────────
     print(f"  Authorized by : {C.GREEN}{args.authorized_by}{C.RESET}")
-    print(f"  LLM           : Google Gemini (via GOOGLE_API_KEY env var)")
+    print(f"  Ollama host   : {args.ollama_host}")
+    print(f"  Model         : {args.model or os.getenv('OLLAMA_MODEL', 'gemma3:4b')}")
     print(f"  MSF           : {'disabled (--no-msf)' if args.no_msf else f'{args.msf_host}:{args.msf_port}'}")
     print()
 

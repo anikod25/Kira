@@ -1,17 +1,25 @@
 """
-kira/llm.py — LLM Interface (Gemini via Vertex AI)
-===================================================
-All communication with the LLM flows through Google Gemini via Vertex AI.
+kira/llm.py — LLM Interface (Ollama backend)
+=============================================
+All LLM communication goes through a local Ollama instance.
+
+API used:
+    POST http://localhost:11434/api/generate
+    {"model": "gemma3:4b", "prompt": "...", "stream": false}
+
+Config (env vars or .env):
+    OLLAMA_HOST   — base URL, default http://localhost:11434
+    OLLAMA_MODEL  — model tag,  default gemma3:4b
 
 Usage:
-    llm = LLMClient()    # Pulls GOOGLE_API_KEY, GEMINI_PROJECT, GEMINI_LOCATION from .env
-
-    # Planner action (JSON mode):
+    llm = LLMClient()
     action = llm.next_action(context_summary, phase="ENUM")
-    # action["tool"], action["args"], action["reasoning"]
+    text   = llm.generate_text("Write an exec summary...")
 
-    # Reporter text (free-text mode):
-    text = llm.generate_text("Write an exec summary for...", temperature=0.3)
+Swapping backends later:
+    Replace _call() and ping() with a new provider's implementation.
+    Everything above those methods (prompt building, JSON parsing,
+    validation, retry logic) is provider-agnostic and stays the same.
 """
 
 import json
@@ -24,21 +32,16 @@ from typing import Optional
 import requests
 
 
-# ── Gemini configuration ──────────────────────────────────────────────────────
+# ── Ollama configuration ──────────────────────────────────────────────────────
 
-GEMINI_API_KEY  = ""                 # Loaded from GOOGLE_API_KEY env var
-GEMINI_MODEL    = "gemini-2.5-flash"
-GEMINI_HOST     = "https://us-central1-aiplatform.googleapis.com"  # Vertex AI endpoint
-GEMINI_PROJECT  = ""                 # GCP project ID — set via env var GEMINI_PROJECT
-GEMINI_LOCATION = "us-central1"      # GCP region
+OLLAMA_HOST    = "http://localhost:11434"
+OLLAMA_MODEL   = "gemma3:4b"
 
 DEFAULT_TIMEOUT = 120
-MAX_RETRIES     = 5  # Increased from 3 to handle rate limits
+MAX_RETRIES     = 3
 RETRY_DELAY     = 1.5
-RATE_LIMIT_BACKOFF = True  # Enable exponential backoff for 429 errors
-INITIAL_BACKOFF = 1.0  # Start with 1 second backoff
 
-# Per-phase temperature: lower for deterministic exploitation decisions.
+# Per-phase temperature — lower = more deterministic
 PHASE_TEMPERATURE = {
     "RECON":        0.2,
     "ENUM":         0.2,
@@ -50,16 +53,17 @@ PHASE_TEMPERATURE = {
 DEFAULT_TEMPERATURE = 0.2
 
 
-# ── Valid tools (unchanged from Day 3) ────────────────────────────────────────
+# ── Valid tools ───────────────────────────────────────────────────────────────
 
 VALID_TOOLS = [
     "nmap_scan", "gobuster_dir", "searchsploit", "enum4linux",
-    "curl_probe", "whatweb", "msf_exploit", "shell_cmd", "linpeas",
+    "curl_probe", "whatweb", "msf_search", "msf_exploit",
+    "shell_cmd", "linpeas",
     "add_finding", "add_note", "advance_phase", "REPORT", "HALT",
 ]
 
 
-# ── Prompts ────────────────────────────────────────────────────────────────────
+# ── Prompts ───────────────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = textwrap.dedent("""
 You are Kira, an autonomous penetration testing AI agent.
@@ -72,18 +76,18 @@ Required keys:
 
 RULES:
 1. Never repeat a tool+args combo already in recent actions.
-2. In ENUM: run curl_probe → whatweb → gobuster_dir → searchsploit (use short query e.g. "apache 2.4").
-3. In EXPLOIT: call msf_search FIRST (e.g. {"query":"apache"}), then use a module name from its results.
+2. In ENUM: run curl_probe → whatweb → gobuster_dir → searchsploit (short query e.g. "apache 2.4").
+3. In EXPLOIT: call msf_search FIRST, then use a module name from its results.
 4. Never invent Metasploit module names. Only use names returned by msf_search.
-5. Always use the correct port in URLs (e.g. http://IP:8080/ not http://IP/).
+5. Always include the correct port in URLs (e.g. http://IP:8080/ not http://IP/).
 6. If stuck with no valid action, emit HALT.
 
 TOOLS:
-  nmap_scan     : {"target":"IP","flags":"-sV -sC"} — omit "ports" to scan all 65535 ports automatically
+  nmap_scan     : {"target":"IP","flags":"-sV -sC"} — omit "ports" to scan all 65535 ports
   gobuster_dir  : {"url":"http://IP:PORT/","wordlist":"/usr/share/wordlists/dirb/common.txt"}
   searchsploit  : {"query":"apache 2.4"}
   enum4linux    : {"target":"IP"}
-  curl_probe    : {"url":"http://IP:PORT/","flags":"-sI"}
+  curl_probe    : {"url":"http://IP:PORT/","flags":"-sIL --max-time 10"}
   whatweb       : {"url":"http://IP:PORT/"}
   msf_search    : {"query":"apache"}
   msf_exploit   : {"module":"exploit/path/from/msf_search","options":{"RHOSTS":"IP","RPORT":8080}}
@@ -96,14 +100,14 @@ TOOLS:
   HALT          : {}
 
 EXAMPLE:
-{"tool":"msf_search","args":{"query":"apache"},"reasoning":"Find real Metasploit module names for Apache before exploiting."}
+{"tool":"nmap_scan","args":{"target":"10.10.10.5","flags":"-sV -sC"},"reasoning":"Start recon with a full port sweep."}
 """).strip()
 
 
 CORRECTION_PROMPT = textwrap.dedent("""
 Your previous response was not valid JSON. Parse error: {error}
 
-You MUST reply with ONLY a raw JSON object using exactly these keys:
+Reply with ONLY a raw JSON object with exactly these keys:
   "tool"      : string
   "args"      : object
   "reasoning" : string
@@ -112,42 +116,45 @@ No markdown. No prose. No code fences. Just the JSON object.
 """).strip()
 
 
-# ── LLMClient ──────────────────────────────────────────────────────────────────
+# ── LLMClient ─────────────────────────────────────────────────────────────────
 
 class LLMClient:
     """
-    Google Gemini LLM client for Kira autonomous penetration testing.
+    Ollama-backed LLM client for Kira.
 
     Parameters
     ----------
-    model   : override model tag (default: GEMINI_MODEL)
-    api_key : API key; falls back to GOOGLE_API_KEY env var
+    host    : Ollama base URL (default: OLLAMA_HOST env var or http://localhost:11434)
+    model   : model tag       (default: OLLAMA_MODEL env var or gemma3:4b)
     timeout : HTTP timeout in seconds
-    verbose : print each call's latency and token count
+    verbose : print call latency and token counts
+
+    Swapping backends:
+        Subclass or replace _call() and ping() — everything else is
+        provider-agnostic (prompt building, JSON parsing, retry logic).
     """
 
     def __init__(
         self,
+        host:    str  = None,
         model:   str  = None,
-        api_key: str  = None,
         timeout: int  = DEFAULT_TIMEOUT,
         verbose: bool = True,
+        # Accept (and ignore) legacy kwargs so callers don't break
+        provider: str = None,
+        api_key:  str = None,
+        project:  str = None,
+        location: str = None,
     ):
-        self.provider = "gemini"
-        self.host    = GEMINI_HOST
-        self.model   = model or GEMINI_MODEL
-        self.api_key = api_key or os.getenv("GOOGLE_API_KEY", GEMINI_API_KEY)
-        self.project = os.getenv("GEMINI_PROJECT", GEMINI_PROJECT)
-        self.location = os.getenv("GEMINI_LOCATION", GEMINI_LOCATION)
-        self.timeout = timeout
-        self.verbose = verbose
+        self.provider = "ollama"
+        self.host     = (host  or os.getenv("OLLAMA_HOST",  OLLAMA_HOST)).rstrip("/")
+        self.model    = (model or os.getenv("OLLAMA_MODEL", OLLAMA_MODEL))
+        self.timeout  = timeout
+        self.verbose  = verbose
         self._call_log: list[dict] = []
 
-        if not self.api_key:
-            raise ValueError(
-                "Gemini requires an API key. "
-                "Pass api_key= or set GOOGLE_API_KEY environment variable."
-            )
+        if self.verbose:
+            print(f"[LLM] Ollama | host={self.host} | model={self.model}")
 
     # ── Public: structured action (JSON mode) ─────────────────────────────────
 
@@ -158,12 +165,12 @@ class LLMClient:
         temperature: float = 0.2,
     ) -> dict:
         """
-        Send a prompt and always return a parsed action dict.
-        Retries up to MAX_RETRIES times on bad JSON.
+        Send a prompt, return a validated action dict.
+        Retries up to MAX_RETRIES on bad JSON.
         Returns a safe HALT dict after all retries are exhausted.
         """
-        messages   = [{"role": "user", "content": user}]
-        last_error = None
+        # Build a single prompt string: system block + user message
+        messages = [{"role": "user", "content": user}]
 
         for attempt in range(1, MAX_RETRIES + 1):
             raw, meta = self._call(system=system, messages=messages, temperature=temperature)
@@ -185,6 +192,7 @@ class LLMClient:
             if self.verbose:
                 self._print_retry(attempt, parse_error)
 
+            # Feed the bad response back so the model can self-correct
             messages.append({"role": "assistant", "content": raw})
             messages.append({
                 "role": "user",
@@ -195,12 +203,9 @@ class LLMClient:
         return self._halt(f"All {MAX_RETRIES} JSON parse attempts failed.", {})
 
     def next_action(self, context_summary: str, phase: str = "") -> dict:
-        """
-        Convenience wrapper — builds the user prompt from context + phase,
-        calls ask(), returns the action dict.
-        """
-        phase_hint = f"\nCurrent phase: {phase}" if phase else ""
-        user_msg   = f"{context_summary}{phase_hint}\n\nWhat is your next action?"
+        """Build user prompt from context + phase, return action dict."""
+        phase_hint  = f"\nCurrent phase: {phase}" if phase else ""
+        user_msg    = f"{context_summary}{phase_hint}\n\nWhat is your next action?"
         temperature = PHASE_TEMPERATURE.get(phase, DEFAULT_TEMPERATURE)
         return self.ask(user=user_msg, temperature=temperature)
 
@@ -213,354 +218,188 @@ class LLMClient:
         max_tokens:  int   = 500,
     ) -> str:
         """
-        Free-text generation — does NOT enforce JSON output.
-        Used by ReportGenerator for exec summary and finding writeups.
-        Includes exponential backoff for rate limits (429).
-
-        Parameters
-        ----------
-        prompt      : user prompt
-        temperature : 0.0–1.0
-        max_tokens  : approximate token cap
-
-        Returns
-        -------
-        str : raw model response, stripped of leading/trailing whitespace
+        Free-text generation for ReportGenerator — no JSON enforcement.
         """
         payload = {
-            "contents": [
-                {
-                    "role": "user",
-                    "parts": [{"text": prompt}],
-                }
-            ],
-            "generationConfig": {
-                "temperature":  temperature,
-                "maxOutputTokens": max_tokens,
-            },
+            "model":   self.model,
+            "prompt":  prompt,
+            "stream":  False,
+            "options": {"temperature": temperature, "num_predict": max_tokens},
         }
-        
-        backoff = INITIAL_BACKOFF
         for attempt in range(1, MAX_RETRIES + 1):
             try:
-                # Vertex AI endpoint with Bearer token auth
-                headers = {"Authorization": f"Bearer {self.api_key}"}
-                url = f"{self.host}/v1/projects/{self.project}/locations/{self.location}/publishers/google/models/{self.model}:generateContent"
                 resp = requests.post(
-                    url,
-                    headers=headers,
+                    f"{self.host}/api/generate",
                     json=payload,
                     timeout=self.timeout,
                 )
-                
-                if resp.status_code == 429:
-                    # Rate limited
-                    if attempt < MAX_RETRIES:
-                        wait_time = backoff * (2 ** (attempt - 1))
-                        if self.verbose:
-                            print(f"[LLM] Rate limited (429). Waiting {wait_time:.1f}s for text generation...")
-                        time.sleep(wait_time)
-                        continue
-                    else:
-                        return "(Rate limited - try again later)"
-                
                 resp.raise_for_status()
-                data = resp.json()
-                # Extract text from Gemini response
-                text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
-                return text.strip()
-            except requests.exceptions.HTTPError as e:
-                if e.response.status_code == 429:
-                    # Rate limited
-                    if attempt < MAX_RETRIES:
-                        wait_time = backoff * (2 ** (attempt - 1))
-                        if self.verbose:
-                            print(f"[LLM] Rate limited (429). Waiting {wait_time:.1f}s...")
-                        time.sleep(wait_time)
-                        continue
-                    else:
-                        return "(Rate limited - try again later)"
-                return f"(Generation error: {e})"
+                return resp.json().get("response", "").strip()
             except Exception as e:
                 if attempt < MAX_RETRIES:
-                    wait_time = backoff * (2 ** (attempt - 1))
-                    if self.verbose:
-                        print(f"[LLM] Error in text generation: {str(e)[:60]}. Retry {attempt}/{MAX_RETRIES}...")
-                    time.sleep(wait_time)
+                    time.sleep(RETRY_DELAY)
                     continue
-                return f"(Generation failed: {str(e)[:50]})"
-        
+                return f"(generate_text failed: {str(e)[:80]})"
         return "(Max retries exceeded)"
 
-    # ── Ping ──────────────────────────────────────────────────────────────────
+    # ── Public: ping ──────────────────────────────────────────────────────────
 
     def ping(self) -> tuple[bool, str]:
         """
-        Quick connectivity check for Gemini API.
-        Makes a minimal generateContent request to verify API key and model work.
-        Includes exponential backoff for rate limits (429).
-        Returns (True, model_name) or (False, error_message).
+        Verify Ollama is reachable and the model is available.
+        Sends a minimal /api/generate request and prints the raw response.
+        Returns (True, model_name) on success, (False, error_msg) on failure.
         """
         payload = {
-            "contents": [
-                {
-                    "role": "user",
-                    "parts": [{"text": "ok"}],
-                }
-            ],
-            "generationConfig": {
-                "temperature": 0.1,
-                "maxOutputTokens": 10,
-            },
+            "model":   self.model,
+            "prompt":  "Reply with the single word: ok",
+            "stream":  False,
+            "options": {"temperature": 0.1, "num_predict": 5},
         }
-        
-        backoff = INITIAL_BACKOFF
-        for attempt in range(1, MAX_RETRIES + 1):
-            try:
-                # Vertex AI endpoint with Bearer token auth
-                headers = {"Authorization": f"Bearer {self.api_key}"}
-                url = f"{self.host}/v1/projects/{self.project}/locations/{self.location}/publishers/google/models/{self.model}:generateContent"
-                resp = requests.post(
-                    url,
-                    headers=headers,
-                    json=payload,
-                    timeout=10,
+        try:
+            resp = requests.post(
+                f"{self.host}/api/generate",
+                json=payload,
+                timeout=15,
+            )
+
+            if self.verbose:
+                print(f"[LLM] Ping → HTTP {resp.status_code} | url={self.host}/api/generate")
+
+            if resp.status_code == 404:
+                # Model not pulled yet
+                body = resp.json() if resp.content else {}
+                return False, (
+                    f"Model '{self.model}' not found on Ollama. "
+                    f"Run: ollama pull {self.model}"
                 )
-                
-                if resp.status_code == 429:
-                    # Rate limited on ping, retry with exponential backoff
-                    if attempt < MAX_RETRIES:
-                        wait_time = backoff * (2 ** (attempt - 1))
-                        if self.verbose:
-                            print(f"[LLM] Ping rate limited (429). Waiting {wait_time:.1f}s...")
-                        time.sleep(wait_time)
-                        continue
-                    else:
-                        return False, "API rate limit exceeded (429). Try again later."
-                
-                if resp.status_code == 404:
-                    # Try listing available models to give better error
-                    try:
-                        list_resp = requests.get(
-                            f"{self.host}/v1beta/models",
-                            params={"key": self.api_key},
-                            timeout=10,
-                        )
-                        if list_resp.status_code == 200:
-                            models = list_resp.json().get("models", [])
-                            available = [m.get("displayName", m.get("name", "?")) for m in models[:3]]
-                            return False, f"Model '{self.model}' not found. Available: {available}. Check https://aistudio.google.com/apikey"
-                    except:
-                        pass
-                    return False, f"Model '{self.model}' not found (404). Check API key and model name at https://aistudio.google.com/apikey"
-                
-                resp.raise_for_status()
-                return True, self.model
-                
-            except requests.exceptions.HTTPError as e:
-                if e.response.status_code == 429:
-                    if attempt < MAX_RETRIES:
-                        wait_time = backoff * (2 ** (attempt - 1))
-                        if self.verbose:
-                            print(f"[LLM] Ping rate limited (429). Waiting {wait_time:.1f}s...")
-                        time.sleep(wait_time)
-                        continue
-                    else:
-                        return False, "API rate limit exceeded (429). Try again later."
-                error_msg = str(e)
-                if "401" in error_msg or "Unauthorized" in error_msg:
-                    return False, "API key invalid or revoked. Check https://aistudio.google.com/apikey"
-                return False, error_msg
-            except Exception as e:
-                if attempt < MAX_RETRIES:
-                    wait_time = backoff * (2 ** (attempt - 1))
-                    if self.verbose:
-                        print(f"[LLM] Ping error: {str(e)[:60]}. Retry {attempt}/{MAX_RETRIES}...")
-                    time.sleep(wait_time)
-                    continue
-                return False, str(e)
-        
-        return False, "Max ping retries exceeded"
 
-    # ── Internal: routing ─────────────────────────────────────────────────────
+            resp.raise_for_status()
+            data = resp.json()
 
-    def _call_with_backoff(self, func, *args, **kwargs):
-        """
-        Execute func with exponential backoff retry on 429 (rate limit) errors.
-        Returns (success, result) tuple.
-        """
-        backoff = INITIAL_BACKOFF
-        for attempt in range(1, MAX_RETRIES + 1):
-            try:
-                result = func(*args, **kwargs)
-                if isinstance(result, requests.Response):
-                    if result.status_code == 429:
-                        # Rate limited, apply exponential backoff
-                        if attempt < MAX_RETRIES:
-                            wait_time = backoff * (2 ** (attempt - 1))
-                            if self.verbose:
-                                print(f"[LLM] Rate limited (429). Waiting {wait_time:.1f}s before retry {attempt}/{MAX_RETRIES}...")
-                            time.sleep(wait_time)
-                            continue
-                        else:
-                            return False, result
-                    else:
-                        result.raise_for_status()
-                return True, result
-            except requests.exceptions.HTTPError as e:
-                if e.response.status_code == 429:
-                    # Rate limited, apply exponential backoff
-                    if attempt < MAX_RETRIES:
-                        wait_time = backoff * (2 ** (attempt - 1))
-                        if self.verbose:
-                            print(f"[LLM] Rate limited (429). Waiting {wait_time:.1f}s before retry {attempt}/{MAX_RETRIES}...")
-                        time.sleep(wait_time)
-                        continue
-                    else:
-                        return False, e
-                return False, e
-            except Exception as e:
-                if attempt < MAX_RETRIES:
-                    wait_time = backoff * (2 ** (attempt - 1))
-                    if self.verbose:
-                        print(f"[LLM] Error: {str(e)[:80]}. Retry {attempt}/{MAX_RETRIES} in {wait_time:.1f}s...")
-                    time.sleep(wait_time)
-                    continue
-                return False, e
-        return False, Exception("Max retries exceeded")
+            if self.verbose:
+                print(f"[LLM] Ping response: {data.get('response', '')!r}")
+
+            return True, self.model
+
+        except requests.exceptions.ConnectionError:
+            return False, (
+                f"Cannot connect to Ollama at {self.host}. "
+                f"Is Ollama running? Start it with: ollama serve"
+            )
+        except requests.exceptions.HTTPError as e:
+            return False, f"HTTP {e.response.status_code}: {e}"
+        except Exception as e:
+            return False, str(e)
+
+    # ── Internal: Ollama call ─────────────────────────────────────────────────
 
     def _call(self, system: str, messages: list, temperature: float) -> tuple:
-        """Call Gemini API with structured prompt."""
-        return self._call_gemini(system, messages, temperature)
-
-    def _call_gemini(self, system: str, messages: list, temperature: float) -> tuple:
         """
-        Call Gemini API with exponential backoff on rate limits.
-        Returns (raw_text, meta) tuple.
+        POST to Ollama /api/generate.
+        Builds a single prompt string from system + conversation history.
+        Returns (raw_text, meta) — raw_text is None on failure.
         """
-        start = time.monotonic()
-        
-        # Convert messages to Gemini format and prepend system message
-        contents = []
-        
-        # Add system message as the first user message
-        if system:
-            contents.append({
-                "role": "user",
-                "parts": [{"text": system}],
-            })
-            contents.append({
-                "role": "model",
-                "parts": [{"text": "Understood. I will follow these instructions."}],
-            })
-        
-        # Add conversation messages
-        for msg in messages:
-            role = "user" if msg["role"] == "user" else "model"
-            contents.append({
-                "role": role,
-                "parts": [{"text": msg["content"]}],
-            })
-        
+        prompt = self._build_prompt(system, messages)
         payload = {
-            "contents": contents,
-            "generationConfig": {
+            "model":   self.model,
+            "prompt":  prompt,
+            "stream":  False,
+            "options": {
                 "temperature": temperature,
-                "maxOutputTokens": 1024,
+                "num_predict": 1024,
             },
         }
-        
-        # Retry loop with exponential backoff
-        backoff = INITIAL_BACKOFF
-        last_error = None
-        
+
+        start = time.monotonic()
         for attempt in range(1, MAX_RETRIES + 1):
             try:
-                # Vertex AI endpoint with Bearer token auth
-                headers = {"Authorization": f"Bearer {self.api_key}"}
-                url = f"{self.host}/v1/projects/{self.project}/locations/{self.location}/publishers/google/models/{self.model}:generateContent"
                 resp = requests.post(
-                    url,
-                    headers=headers,
+                    f"{self.host}/api/generate",
                     json=payload,
                     timeout=self.timeout,
                 )
-                
-                if resp.status_code == 429:
-                    # Rate limited
-                    if attempt < MAX_RETRIES:
-                        wait_time = backoff * (2 ** (attempt - 1))
-                        if self.verbose:
-                            print(f"[LLM] Rate limited (429). Waiting {wait_time:.1f}s (attempt {attempt}/{MAX_RETRIES})...")
-                        time.sleep(wait_time)
-                        continue
-                    else:
-                        last_error = "Rate limit exceeded after max retries"
-                        break
-                
                 resp.raise_for_status()
-                data = resp.json()
-                raw_text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
-                usage = data.get("usageMetadata", {})
+                data     = resp.json()
+                raw_text = data.get("response", "")
                 meta = {
                     "latency_s":     round(time.monotonic() - start, 2),
-                    "output_tokens": usage.get("outputTokenCount", 0),
+                    "output_tokens": data.get("eval_count", 0),
                     "model":         self.model,
-                    "provider":      "gemini",
+                    "provider":      "ollama",
                     "attempts":      attempt,
                 }
                 return raw_text, meta
-                
-            except requests.exceptions.HTTPError as e:
-                if e.response.status_code == 429:
-                    # Rate limited
-                    if attempt < MAX_RETRIES:
-                        wait_time = backoff * (2 ** (attempt - 1))
-                        if self.verbose:
-                            print(f"[LLM] Rate limited (429). Waiting {wait_time:.1f}s (attempt {attempt}/{MAX_RETRIES})...")
-                        time.sleep(wait_time)
-                        continue
-                    else:
-                        last_error = str(e)
-                        break
-                last_error = str(e)
-                if attempt < MAX_RETRIES:
-                    wait_time = backoff * (2 ** (attempt - 1))
-                    if self.verbose:
-                        print(f"[LLM] HTTP Error: {e}. Retry {attempt}/{MAX_RETRIES} in {wait_time:.1f}s...")
-                    time.sleep(wait_time)
-                    continue
-                break
-                
+
             except Exception as e:
-                last_error = str(e)
                 if attempt < MAX_RETRIES:
-                    wait_time = backoff * (2 ** (attempt - 1))
                     if self.verbose:
-                        print(f"[LLM] Error: {str(e)[:80]}. Retry {attempt}/{MAX_RETRIES} in {wait_time:.1f}s...")
-                    time.sleep(wait_time)
+                        print(f"[LLM] Error: {str(e)[:80]}. Retry {attempt}/{MAX_RETRIES}...")
+                    time.sleep(RETRY_DELAY)
                     continue
-                break
-        
-        meta = {
-            "error":     last_error or "Unknown error",
-            "latency_s": round(time.monotonic() - start, 2),
-            "provider":  "gemini",
-            "attempts":  MAX_RETRIES,
-        }
+                meta = {
+                    "error":     str(e),
+                    "latency_s": round(time.monotonic() - start, 2),
+                    "provider":  "ollama",
+                    "attempts":  attempt,
+                }
+                return None, meta
+
+        meta = {"error": "Max retries exceeded", "provider": "ollama", "attempts": MAX_RETRIES}
         return None, meta
 
-    # ── Internal: parsing + validation ────────────────────────────────────────
+    # ── Internal: prompt builder ──────────────────────────────────────────────
+
+    @staticmethod
+    def _build_prompt(system: str, messages: list) -> str:
+        """
+        Flatten system prompt + conversation into a single string for
+        Ollama's /api/generate endpoint (which takes a plain prompt, not
+        a messages array).
+
+        Format:
+            <system>
+            ### SYSTEM
+            {system}
+            </system>
+
+            ### USER
+            {msg1}
+
+            ### ASSISTANT
+            {msg2}
+
+            ### USER
+            {msg3}
+        """
+        parts = []
+        if system:
+            parts.append(f"### SYSTEM\n{system}")
+
+        for msg in messages:
+            role  = "USER" if msg["role"] == "user" else "ASSISTANT"
+            parts.append(f"### {role}\n{msg['content']}")
+
+        # Prompt the model to respond as ASSISTANT
+        parts.append("### ASSISTANT")
+        return "\n\n".join(parts)
+
+    # ── Internal: JSON parsing + validation ───────────────────────────────────
 
     def _parse_json(self, raw: str) -> tuple[Optional[dict], Optional[str]]:
         text = raw.strip()
+        # Strip markdown code fences if the model wraps output
         if text.startswith("```"):
             lines = text.splitlines()
             text  = "\n".join(lines[1:-1]).strip()
+        # Some models prefix with a label like "json\n{...}"
+        if text.lower().startswith("json"):
+            text = text[4:].strip()
         try:
             parsed = json.loads(text)
         except json.JSONDecodeError as e:
             return None, f"{e} — raw: {text[:120]!r}"
+        # Unwrap single-key wrapper objects e.g. {"action": {...}}
         if isinstance(parsed, dict) and len(parsed) == 1:
             inner = next(iter(parsed.values()))
             if isinstance(inner, dict):
@@ -586,7 +425,7 @@ class LLMClient:
             "reasoning": obj["reasoning"].strip(),
         }, None
 
-    # ── Internal: helpers ──────────────────────────────────────────────────────
+    # ── Internal: helpers ─────────────────────────────────────────────────────
 
     def _halt(self, reason: str, meta: dict = None) -> dict:
         return {"tool": "HALT", "args": {}, "reasoning": reason, "_meta": meta or {}}
@@ -598,21 +437,20 @@ class LLMClient:
             "ok":        ok,
             "latency_s": meta.get("latency_s"),
             "tokens":    meta.get("output_tokens"),
-            "provider":  meta.get("provider", self.provider),
+            "provider":  "ollama",
         })
 
     def _print_ok(self, action: dict, meta: dict) -> None:
         try:
             from rich.console import Console
             Console().print(
-                f"[dim][LLM/{self.provider}][/dim] "
+                f"[dim][LLM/ollama][/dim] "
                 f"[green]{action['tool']}[/green] "
                 f"[dim]({meta.get('latency_s','?')}s, "
                 f"{meta.get('output_tokens','?')} tokens)[/dim]"
             )
-            Console().print(f"  [dim italic]{action['reasoning']}[/dim italic]")
         except ImportError:
-            print(f"[LLM/{self.provider}] {action['tool']} ({meta.get('latency_s')}s) — {action['reasoning']}")
+            print(f"[LLM/ollama] {action['tool']} ({meta.get('latency_s')}s)")
 
     def _print_retry(self, attempt: int, error: str) -> None:
         try:
@@ -624,67 +462,104 @@ class LLMClient:
             print(f"[LLM] Attempt {attempt} failed: {error[:80]}")
 
 
-# ── Helpers ────────────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _ts() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
-# ── Smoke test ─────────────────────────────────────────────────────────────────
+# ── Smoke test ────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import sys
 
-    print("=== llm.py smoke test (Gemini-only) ===\n")
+    print("=== llm.py smoke test (Ollama) ===\n")
 
-    # [1] Basic initialization — Gemini
-    print("[1] LLMClient(api_key='test-key')")
-    try:
-        llm = LLMClient(api_key="test-key", verbose=False)
-        assert llm.provider == "gemini"
-        assert llm.model == GEMINI_MODEL
-        print(f"    provider={llm.provider}  model={llm.model}  host={llm.host}  OK\n")
-    except Exception as e:
-        print(f"    ERROR: {e}\n")
-        sys.exit(1)
+    # [1] Default init
+    print("[1] Default init")
+    c = LLMClient(verbose=False)
+    assert c.provider == "ollama"
+    assert c.host == OLLAMA_HOST
+    assert c.model == OLLAMA_MODEL
+    print(f"    OK — provider={c.provider} host={c.host} model={c.model}")
 
-    # [2] Gemini requires key
-    print("[2] Gemini without key raises ValueError")
-    os.environ.pop("GOOGLE_API_KEY", None)
-    try:
-        LLMClient(verbose=False)
-        assert False, "Should raise"
-    except ValueError as e:
-        print(f"    Correctly raised: {e}\n")
+    # [2] Custom host + model
+    print("\n[2] Custom host + model")
+    c2 = LLMClient(host="http://10.0.0.1:11434", model="llama3:8b", verbose=False)
+    assert c2.host == "http://10.0.0.1:11434"
+    assert c2.model == "llama3:8b"
+    print(f"    OK — host={c2.host} model={c2.model}")
 
-    # [3] generate_text exists
-    print("[3] generate_text() method exists")
-    client = LLMClient(api_key="test-key", verbose=False)
-    assert hasattr(client, "generate_text"), "generate_text missing"
-    print(f"    generate_text present  OK\n")
+    # [3] Trailing slash stripped from host
+    print("\n[3] Trailing slash stripped")
+    c3 = LLMClient(host="http://localhost:11434/", verbose=False)
+    assert not c3.host.endswith("/")
+    print(f"    OK — host={c3.host}")
 
-    # [4] JSON parse + validation (provider-independent)
-    print("[4] _parse_json + _validate_action")
-    llm2 = LLMClient(api_key="test-key", verbose=False)
-    parsed, err = llm2._parse_json(
-        '{"tool": "nmap_scan", "args": {"target": "10.10.10.5"}, "reasoning": "Start."}'
+    # [4] Prompt builder
+    print("\n[4] _build_prompt")
+    prompt = LLMClient._build_prompt(
+        system="You are a tester.",
+        messages=[
+            {"role": "user",      "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+            {"role": "user",      "content": "go"},
+        ],
     )
-    assert parsed is not None and err is None
-    validated, verr = llm2._validate_action(parsed)
-    assert validated is not None and verr is None
-    print(f"    parse+validate OK: tool={validated['tool']}\n")
+    assert "### SYSTEM" in prompt
+    assert "You are a tester." in prompt
+    assert "### USER\nhello" in prompt
+    assert "### ASSISTANT\nhi" in prompt
+    assert prompt.endswith("### ASSISTANT")
+    print(f"    OK — {len(prompt)} chars")
 
-    # [5] Live Gemini ping (only if API key is available)
-    print("[5] Pinging Gemini API...")
-    api_key = os.getenv("GOOGLE_API_KEY")
-    if api_key:
-        llm3 = LLMClient(api_key=api_key, verbose=True)
-        ok, msg = llm3.ping()
-        if ok:
-            print(f"    Reachable — model: {msg}")
-        else:
-            print(f"    Unreachable: {msg}")
+    # [5] JSON parse — clean
+    print("\n[5] _parse_json — clean JSON")
+    parsed, err = c._parse_json(
+        '{"tool":"nmap_scan","args":{"target":"10.0.0.1"},"reasoning":"Start."}'
+    )
+    assert parsed and not err
+    print(f"    OK — {parsed}")
+
+    # [6] JSON parse — strips code fences
+    print("\n[6] _parse_json — strips markdown fences")
+    parsed2, err2 = c._parse_json(
+        '```json\n{"tool":"HALT","args":{},"reasoning":"done"}\n```'
+    )
+    assert parsed2 and not err2 and parsed2["tool"] == "HALT"
+    print(f"    OK — {parsed2}")
+
+    # [7] Validate action
+    print("\n[7] _validate_action")
+    validated, verr = c._validate_action(
+        {"tool": "searchsploit", "args": {"query": "apache"}, "reasoning": "check vulns"}
+    )
+    assert validated and not verr
+    print(f"    OK — tool={validated['tool']}")
+
+    # [8] Unknown tool rejected
+    print("\n[8] Unknown tool rejected")
+    _, verr2 = c._validate_action(
+        {"tool": "fake_tool", "args": {}, "reasoning": "test"}
+    )
+    assert verr2 and "Unknown tool" in verr2
+    print(f"    OK — {verr2[:60]}")
+
+    # [9] msf_search in VALID_TOOLS
+    print("\n[9] msf_search in VALID_TOOLS")
+    assert "msf_search" in VALID_TOOLS
+    print(f"    OK")
+
+    # [10] Live ping
+    print("\n[10] Live Ollama ping")
+    host  = os.getenv("OLLAMA_HOST", OLLAMA_HOST)
+    model = os.getenv("OLLAMA_MODEL", OLLAMA_MODEL)
+    live  = LLMClient(host=host, model=model, verbose=True)
+    ok, msg = live.ping()
+    if ok:
+        print(f"    PASS — model: {msg}")
     else:
-        print(f"    Skipped (set GOOGLE_API_KEY to test live)")
+        print(f"    FAIL — {msg}")
+        print(f"    (Start Ollama with: ollama serve && ollama pull {model})")
 
     print("\nAll offline tests passed.")
