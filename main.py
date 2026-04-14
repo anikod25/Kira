@@ -34,6 +34,7 @@ try:
     from kira.tool_runner import ToolRunner
     from kira.findings    import KnowledgeBase
     from kira.planner     import Planner
+    from kira.chat        import KiraChat
     from kira.logger      import KiraLogger
     from kira.reporter    import ReportGenerator
     from kira.guardrails  import ScopeGuard
@@ -544,7 +545,15 @@ def main():
     t_start = time.monotonic()
 
     try:
-        outcome = planner.run(max_iterations=args.max_iter)
+        chat = KiraChat(
+            planner=planner,
+            state=state,
+            llm=llm,
+            max_iter=args.max_iter,
+            verbose=args.verbose,
+        )
+        chat.start()
+        outcome = "DONE"   # KiraChat manages its own lifecycle
     except KeyboardInterrupt:
         outcome = "INTERRUPTED"
         print(f"\n{C.YELLOW}[KIRA] Interrupted by user.{C.RESET}")
