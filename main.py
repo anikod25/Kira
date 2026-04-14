@@ -21,6 +21,13 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+# ── Load .env file if present ─────────────────────────────────────────────────
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # dotenv optional — fall back to real env vars
+
 
 # ── Kira package root ─────────────────────────────────────────────────────────
 # Allow running as `python main.py` from the kira/ directory or project root.
@@ -167,15 +174,18 @@ def build_llm(args, verbose: bool) -> LLMClient:
         kwargs["model"] = args.model
     if provider == "ollama":
         kwargs["host"] = args.ollama_host
-    elif provider in ("anthropic", "openai"):
-        key = args.api_key or os.getenv(
-            "ANTHROPIC_API_KEY" if provider == "anthropic" else "OPENAI_API_KEY", ""
-        )
+    elif provider in ("anthropic", "openai", "gemini"):
+        env_var = {
+            "anthropic": "ANTHROPIC_API_KEY",
+            "openai":    "OPENAI_API_KEY",
+            "gemini":    "GEMINI_API_KEY",
+        }[provider]
+        key = args.api_key or os.getenv(env_var, "")
         if not key:
             _die(
                 f"Provider '{provider}' requires an API key.\n"
-                f"Pass --api-key sk-... or set the environment variable:\n"
-                f"  export {'ANTHROPIC_API_KEY' if provider == 'anthropic' else 'OPENAI_API_KEY'}=sk-..."
+                f"Pass --api-key or set the environment variable:\n"
+                f"  export {env_var}=your-key-here"
             )
         kwargs["api_key"] = key
 
@@ -403,7 +413,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     # LLM
     parser.add_argument("--provider", default=None,
-                        choices=["ollama", "anthropic", "openai"],
+                        choices=["ollama", "anthropic", "openai", "gemini"],
                         help="LLM provider (default: ollama)")
     parser.add_argument("--ollama-host",
                         default=os.getenv("OLLAMA_HOST", "http://localhost:11434"),
