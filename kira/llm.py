@@ -35,8 +35,10 @@ GEMINI_KEY      = ""                 # or: export GEMINI_API_KEY=...
 GEMINI_MODEL    = "gemini-2.0-flash"
 
 DEFAULT_TIMEOUT = 120
-MAX_RETRIES     = 3
+MAX_RETRIES     = 5  # Increased from 3 to handle rate limits
 RETRY_DELAY     = 1.5
+RATE_LIMIT_BACKOFF = True  # Enable exponential backoff for 429 errors
+INITIAL_BACKOFF = 1.0  # Start with 1 second backoff
 
 # Per-phase temperature: lower for deterministic exploitation decisions.
 PHASE_TEMPERATURE = {
@@ -214,6 +216,7 @@ class LLMClient:
         """
         Free-text generation — does NOT enforce JSON output.
         Used by ReportGenerator for exec summary and finding writeups.
+        Includes exponential backoff for rate limits (429).
 
         Parameters
         ----------
@@ -237,20 +240,55 @@ class LLMClient:
                 "maxOutputTokens": max_tokens,
             },
         }
-        try:
-            resp = requests.post(
-                f"{self.host}/v1beta/models/{self.model}:generateContent",
-                params={"key": self.api_key},
-                json=payload,
-                timeout=self.timeout,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            # Extract text from Gemini response
-            text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
-            return text.strip()
-        except Exception:
-            return ""
+        
+        backoff = INITIAL_BACKOFF
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                resp = requests.post(
+                    f"{self.host}/v1beta/models/{self.model}:generateContent",
+                    params={"key": self.api_key},
+                    json=payload,
+                    timeout=self.timeout,
+                )
+                
+                if resp.status_code == 429:
+                    # Rate limited
+                    if attempt < MAX_RETRIES:
+                        wait_time = backoff * (2 ** (attempt - 1))
+                        if self.verbose:
+                            print(f"[LLM] Rate limited (429). Waiting {wait_time:.1f}s for text generation...")
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        return "(Rate limited - try again later)"
+                
+                resp.raise_for_status()
+                data = resp.json()
+                # Extract text from Gemini response
+                text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+                return text.strip()
+            except requests.exceptions.HTTPError as e:
+                if e.response.status_code == 429:
+                    # Rate limited
+                    if attempt < MAX_RETRIES:
+                        wait_time = backoff * (2 ** (attempt - 1))
+                        if self.verbose:
+                            print(f"[LLM] Rate limited (429). Waiting {wait_time:.1f}s...")
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        return "(Rate limited - try again later)"
+                return f"(Generation error: {e})"
+            except Exception as e:
+                if attempt < MAX_RETRIES:
+                    wait_time = backoff * (2 ** (attempt - 1))
+                    if self.verbose:
+                        print(f"[LLM] Error in text generation: {str(e)[:60]}. Retry {attempt}/{MAX_RETRIES}...")
+                    time.sleep(wait_time)
+                    continue
+                return f"(Generation failed: {str(e)[:50]})"
+        
+        return "(Max retries exceeded)"
 
     def _generate_text_gemini(self, prompt: str, temperature: float, max_tokens: int) -> str:
         url = (
@@ -279,58 +317,145 @@ class LLMClient:
         """
         Quick connectivity check for Gemini API.
         Makes a minimal generateContent request to verify API key and model work.
+        Includes exponential backoff for rate limits (429).
         Returns (True, model_name) or (False, error_message).
         """
-        try:
-            payload = {
-                "contents": [
-                    {
-                        "role": "user",
-                        "parts": [{"text": "ok"}],
-                    }
-                ],
-                "generationConfig": {
-                    "temperature": 0.1,
-                    "maxOutputTokens": 10,
-                },
-            }
-            resp = requests.post(
-                f"{self.host}/v1beta/models/{self.model}:generateContent",
-                params={"key": self.api_key},
-                json=payload,
-                timeout=10,
-            )
-            if resp.status_code == 404:
-                # Try listing available models to give better error
-                try:
-                    list_resp = requests.get(
-                        f"{self.host}/v1beta/models",
-                        params={"key": self.api_key},
-                        timeout=10,
-                    )
-                    if list_resp.status_code == 200:
-                        models = list_resp.json().get("models", [])
-                        available = [m.get("displayName", m.get("name", "?")) for m in models[:3]]
-                        return False, f"Model '{self.model}' not found. Available: {available}. Check https://aistudio.google.com/apikey"
-                except:
-                    pass
-                return False, f"Model '{self.model}' not found (404). Check API key and model name at https://aistudio.google.com/apikey"
-            resp.raise_for_status()
-            return True, self.model
-        except Exception as e:
-            error_msg = str(e)
-            if "401" in error_msg or "Unauthorized" in error_msg:
-                return False, "API key invalid or revoked. Check https://aistudio.google.com/apikey"
-            return False, error_msg
+        payload = {
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [{"text": "ok"}],
+                }
+            ],
+            "generationConfig": {
+                "temperature": 0.1,
+                "maxOutputTokens": 10,
+            },
+        }
+        
+        backoff = INITIAL_BACKOFF
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                resp = requests.post(
+                    f"{self.host}/v1beta/models/{self.model}:generateContent",
+                    params={"key": self.api_key},
+                    json=payload,
+                    timeout=10,
+                )
+                
+                if resp.status_code == 429:
+                    # Rate limited on ping, retry with exponential backoff
+                    if attempt < MAX_RETRIES:
+                        wait_time = backoff * (2 ** (attempt - 1))
+                        if self.verbose:
+                            print(f"[LLM] Ping rate limited (429). Waiting {wait_time:.1f}s...")
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        return False, "API rate limit exceeded (429). Try again later."
+                
+                if resp.status_code == 404:
+                    # Try listing available models to give better error
+                    try:
+                        list_resp = requests.get(
+                            f"{self.host}/v1beta/models",
+                            params={"key": self.api_key},
+                            timeout=10,
+                        )
+                        if list_resp.status_code == 200:
+                            models = list_resp.json().get("models", [])
+                            available = [m.get("displayName", m.get("name", "?")) for m in models[:3]]
+                            return False, f"Model '{self.model}' not found. Available: {available}. Check https://aistudio.google.com/apikey"
+                    except:
+                        pass
+                    return False, f"Model '{self.model}' not found (404). Check API key and model name at https://aistudio.google.com/apikey"
+                
+                resp.raise_for_status()
+                return True, self.model
+                
+            except requests.exceptions.HTTPError as e:
+                if e.response.status_code == 429:
+                    if attempt < MAX_RETRIES:
+                        wait_time = backoff * (2 ** (attempt - 1))
+                        if self.verbose:
+                            print(f"[LLM] Ping rate limited (429). Waiting {wait_time:.1f}s...")
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        return False, "API rate limit exceeded (429). Try again later."
+                error_msg = str(e)
+                if "401" in error_msg or "Unauthorized" in error_msg:
+                    return False, "API key invalid or revoked. Check https://aistudio.google.com/apikey"
+                return False, error_msg
+            except Exception as e:
+                if attempt < MAX_RETRIES:
+                    wait_time = backoff * (2 ** (attempt - 1))
+                    if self.verbose:
+                        print(f"[LLM] Ping error: {str(e)[:60]}. Retry {attempt}/{MAX_RETRIES}...")
+                    time.sleep(wait_time)
+                    continue
+                return False, str(e)
+        
+        return False, "Max ping retries exceeded"
 
     # ── Internal: routing ─────────────────────────────────────────────────────
+
+    def _call_with_backoff(self, func, *args, **kwargs):
+        """
+        Execute func with exponential backoff retry on 429 (rate limit) errors.
+        Returns (success, result) tuple.
+        """
+        backoff = INITIAL_BACKOFF
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                result = func(*args, **kwargs)
+                if isinstance(result, requests.Response):
+                    if result.status_code == 429:
+                        # Rate limited, apply exponential backoff
+                        if attempt < MAX_RETRIES:
+                            wait_time = backoff * (2 ** (attempt - 1))
+                            if self.verbose:
+                                print(f"[LLM] Rate limited (429). Waiting {wait_time:.1f}s before retry {attempt}/{MAX_RETRIES}...")
+                            time.sleep(wait_time)
+                            continue
+                        else:
+                            return False, result
+                    else:
+                        result.raise_for_status()
+                return True, result
+            except requests.exceptions.HTTPError as e:
+                if e.response.status_code == 429:
+                    # Rate limited, apply exponential backoff
+                    if attempt < MAX_RETRIES:
+                        wait_time = backoff * (2 ** (attempt - 1))
+                        if self.verbose:
+                            print(f"[LLM] Rate limited (429). Waiting {wait_time:.1f}s before retry {attempt}/{MAX_RETRIES}...")
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        return False, e
+                return False, e
+            except Exception as e:
+                if attempt < MAX_RETRIES:
+                    wait_time = backoff * (2 ** (attempt - 1))
+                    if self.verbose:
+                        print(f"[LLM] Error: {str(e)[:80]}. Retry {attempt}/{MAX_RETRIES} in {wait_time:.1f}s...")
+                    time.sleep(wait_time)
+                    continue
+                return False, e
+        return False, Exception("Max retries exceeded")
 
     def _call(self, system: str, messages: list, temperature: float) -> tuple:
         """Call Gemini API with structured prompt."""
         return self._call_gemini(system, messages, temperature)
 
     def _call_gemini(self, system: str, messages: list, temperature: float) -> tuple:
+        """
+        Call Gemini API with exponential backoff on rate limits.
+        Returns (raw_text, meta) tuple.
+        """
         start = time.monotonic()
+        
         # Convert messages to Gemini format and prepend system message
         contents = []
         
@@ -360,32 +485,83 @@ class LLMClient:
                 "maxOutputTokens": 1024,
             },
         }
-        meta = {}
-        try:
-            resp = requests.post(
-                f"{self.host}/v1beta/models/{self.model}:generateContent",
-                params={"key": self.api_key},
-                json=payload,
-                timeout=self.timeout,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            raw_text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
-            usage = data.get("usageMetadata", {})
-            meta = {
-                "latency_s":     round(time.monotonic() - start, 2),
-                "output_tokens": usage.get("outputTokenCount", 0),
-                "model":         self.model,
-                "provider":      "gemini",
-            }
-            return raw_text, meta
-        except Exception as e:
-            meta = {
-                "error":     str(e),
-                "latency_s": round(time.monotonic() - start, 2),
-                "provider":  "gemini",
-            }
-            return None, meta
+        
+        # Retry loop with exponential backoff
+        backoff = INITIAL_BACKOFF
+        last_error = None
+        
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                resp = requests.post(
+                    f"{self.host}/v1beta/models/{self.model}:generateContent",
+                    params={"key": self.api_key},
+                    json=payload,
+                    timeout=self.timeout,
+                )
+                
+                if resp.status_code == 429:
+                    # Rate limited
+                    if attempt < MAX_RETRIES:
+                        wait_time = backoff * (2 ** (attempt - 1))
+                        if self.verbose:
+                            print(f"[LLM] Rate limited (429). Waiting {wait_time:.1f}s (attempt {attempt}/{MAX_RETRIES})...")
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        last_error = "Rate limit exceeded after max retries"
+                        break
+                
+                resp.raise_for_status()
+                data = resp.json()
+                raw_text = data.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+                usage = data.get("usageMetadata", {})
+                meta = {
+                    "latency_s":     round(time.monotonic() - start, 2),
+                    "output_tokens": usage.get("outputTokenCount", 0),
+                    "model":         self.model,
+                    "provider":      "gemini",
+                    "attempts":      attempt,
+                }
+                return raw_text, meta
+                
+            except requests.exceptions.HTTPError as e:
+                if e.response.status_code == 429:
+                    # Rate limited
+                    if attempt < MAX_RETRIES:
+                        wait_time = backoff * (2 ** (attempt - 1))
+                        if self.verbose:
+                            print(f"[LLM] Rate limited (429). Waiting {wait_time:.1f}s (attempt {attempt}/{MAX_RETRIES})...")
+                        time.sleep(wait_time)
+                        continue
+                    else:
+                        last_error = str(e)
+                        break
+                last_error = str(e)
+                if attempt < MAX_RETRIES:
+                    wait_time = backoff * (2 ** (attempt - 1))
+                    if self.verbose:
+                        print(f"[LLM] HTTP Error: {e}. Retry {attempt}/{MAX_RETRIES} in {wait_time:.1f}s...")
+                    time.sleep(wait_time)
+                    continue
+                break
+                
+            except Exception as e:
+                last_error = str(e)
+                if attempt < MAX_RETRIES:
+                    wait_time = backoff * (2 ** (attempt - 1))
+                    if self.verbose:
+                        print(f"[LLM] Error: {str(e)[:80]}. Retry {attempt}/{MAX_RETRIES} in {wait_time:.1f}s...")
+                    time.sleep(wait_time)
+                    continue
+                break
+        
+        meta = {
+            "error":     last_error or "Unknown error",
+            "latency_s": round(time.monotonic() - start, 2),
+            "provider":  "gemini",
+            "attempts":  MAX_RETRIES,
+        }
+        return None, meta
 
     def _call_gemini(self, system: str, messages: list, temperature: float) -> tuple:
         start = time.monotonic()
