@@ -248,6 +248,49 @@ class KiraChat:
         match = _IPV4_RE.search(message)
         return match.group(1) if match else None
 
+    def _extract_iterations(self, message: str) -> int | None:
+        """
+        Extracts iteration count from message.
+        Looks for patterns like:
+          - "scan 10.10.10.5 for 15 iterations"
+          - "scan 10.10.10.5 with 20 iterations"
+          - "scan 10.10.10.5 in 30 steps"
+          - "scan 10.10.10.5 25"
+        Returns the number, or None if not found.
+        """
+        lower = message.lower()
+        
+        # Pattern: "for/with/in NUMBER (iterations/steps/rounds/times)"
+        patterns = [
+            r"(?:for|with|in)\s+(\d+)\s*(?:iterations?|steps?|rounds?|times?)?",
+            r"(?:iterations?|steps?|rounds?|times?)\s+(\d+)",
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, lower)
+            if match:
+                try:
+                    return int(match.group(1))
+                except (ValueError, IndexError):
+                    pass
+        
+        # Also check for a bare number at the end (e.g., "scan 10.10.10.5 25")
+        # But only if there's an IP in the message (to avoid false positives)
+        if _IPV4_RE.search(message):
+            numbers = re.findall(r"\b(\d+)\b", message)
+            # Filter out IP octets (numbers that appear in the IP)
+            ip_octets = set()
+            for ip_match in _IPV4_RE.finditer(message):
+                ip = ip_match.group(1)
+                ip_octets.update(ip.split("."))
+            
+            for num_str in reversed(numbers):  # Check from end of message
+                num = int(num_str)
+                if num_str not in ip_octets and 1 <= num <= 1000:
+                    return num
+        
+        return None
+
     # ── Chat handler ──────────────────────────────────────────────────────────
 
     def _handle_chat(self, message: str) -> None:
@@ -290,7 +333,7 @@ class KiraChat:
 
     def _handle_scan_trigger(self, message: str) -> None:
         """
-        Extracts IP from message, initializes target if new,
+        Extracts IP and iteration count from message, initializes target if new,
         calls planner.run(), prints result summary, returns to chat mode.
         """
         extracted_ip = self._extract_ip(message)
@@ -301,8 +344,31 @@ class KiraChat:
         elif self._state:
             target = self._state.target
         else:
-            self._print_kira("No target IP found in your message. Please specify one (e.g., '10.10.10.5').")
+            self._print_kira("No target IP found in your message. Please specify one (e.g., '10.10.10.5 for 15 iterations').")
             return
+
+        # Extract iteration count from message, or ask user
+        max_iterations = self._extract_iterations(message)
+        
+        if max_iterations is None:
+            # Prompt user for iteration count
+            try:
+                print()  # Blank line for readability
+                iter_input = input(f"[KIRA] How many iterations? (default {self._max_iter}): ").strip()
+                if iter_input:
+                    try:
+                        max_iterations = int(iter_input)
+                        if max_iterations < 1:
+                            max_iterations = self._max_iter
+                            self._print_kira(f"Invalid input. Using default {self._max_iter} iterations.")
+                    except ValueError:
+                        max_iterations = self._max_iter
+                        self._print_kira(f"Invalid number. Using default {self._max_iter} iterations.")
+                else:
+                    max_iterations = self._max_iter
+            except (EOFError, KeyboardInterrupt):
+                self._print_kira("Scan cancelled.")
+                return
 
         # Initialize target if not already done
         if not self._state or self._state.target != target:
@@ -313,13 +379,14 @@ class KiraChat:
                 return
 
         print(f"\n[KIRA] Understood. Starting autonomous scan on {target}...")
+        print(f"[KIRA] Max iterations: {max_iterations}")
         print(f"[KIRA] You can interrupt with Ctrl+C at any time.\n")
 
         t_start = time.monotonic()
         outcome = "ERROR"
 
         try:
-            outcome = self._planner.run(max_iterations=self._max_iter)
+            outcome = self._planner.run(max_iterations=max_iterations)
         except KeyboardInterrupt:
             outcome = "INTERRUPTED"
             print(f"\n[KIRA] Scan interrupted by user.")
