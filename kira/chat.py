@@ -229,7 +229,6 @@ class KiraChat:
         if extracted_ip:
             current_target = self.state.target
             if current_target != extracted_ip:
-                # Re-init state for new target
                 print(
                     f"{C.YELLOW}[KIRA]{C.RESET} Target changed from "
                     f"{current_target} to {extracted_ip}. Resetting state.\n"
@@ -237,62 +236,117 @@ class KiraChat:
                 self.state.init(target=extracted_ip, authorized_by=self.state.get("authorized_by"))
             target = extracted_ip
         else:
-            # Use current state target
             target = self.state.target
-            if not target:
+            if not target or target == "pending":
                 print(
                     f"{C.YELLOW}[KIRA]{C.RESET} No IP found in message. "
                     f"Please provide a target IP (e.g., 'start scan on 10.10.10.5').\n"
                 )
                 return
 
-        # Confirmation
-        print(f"{C.GREEN}[KIRA]{C.RESET} Understood. Starting autonomous scan on {target}...")
-        print(f"{C.DIM}       You can interrupt with Ctrl+C at any time.{C.RESET}\n")
+        # Install a real ScopeGuard now that we have a valid target
+        from kira.guardrails import ScopeGuard
+        guard = ScopeGuard(
+            authorized_target=target,
+            authorized_by=self.state.get("authorized_by") or "authorized",
+        )
+        self.planner._guard = guard
+
+        # Confirmation + old-style header to match original output
+        print(f"\n{'─' * 50}")
+        print(f"  STARTING AGENT LOOP")
+        print(f"{'─' * 50}")
+        print(f"\n\033[1m\033[92m[KIRA] Agent loop starting...\033[0m")
+        print(f"\033[2m       Target: {target}  |  Max iterations: {self.max_iter}\033[0m\n")
 
         # Run the planner synchronously
         try:
             outcome = self.planner.run(max_iterations=self.max_iter)
         except KeyboardInterrupt:
             outcome = "INTERRUPTED"
-            print(f"\n{C.YELLOW}[KIRA]{C.RESET} Interrupted by user.\n")
+            print(f"\n\033[93m[KIRA] Interrupted by user.\033[0m\n")
 
-        # Print session summary
-        print(f"\n{C.GREEN}[KIRA]{C.RESET} Session ended: {outcome}\n")
+        # Old-style session complete section
+        print(f"\n{'─' * 50}")
+        print(f"  SESSION COMPLETE")
+        print(f"{'─' * 50}")
+        outcome_label = {
+            "HALTED":      "HALTED",
+            "MAX_ITER":    "MAX_ITER",
+            "DONE":        "DONE",
+            "INTERRUPTED": "INTERRUPTED",
+        }.get(outcome, outcome)
+        print(f"Outcome: {outcome_label}")
+        print(f"{'─' * 50}")
         self._print_session_summary()
+        if outcome in ("HALTED", "MAX_ITER"):
+            print(f"  Tip: review {self.state.session_dir}/actions.jsonl to see why the agent stopped.")
+        print()
 
         # Return to chat mode
         print()
 
     def _print_session_summary(self) -> None:
-        """Print a compact summary of the session after scan completes."""
+        """Print session summary matching the original Kira output format exactly."""
+        import time
+        from kira.tool_runner import ToolRunner as TR
+
         findings = self.state.get("findings") or []
-        ports = self.state.get("open_ports") or []
+        ports    = self.state.get("open_ports") or []
         sessions = self.state.get("sessions") or []
-        is_root = self.state.get("is_root", False)
-        phase = self.state.get("phase", "?")
+        is_root  = self.state.get("is_root", False)
+        phase    = self.state.get("phase", "?")
+
+        # Get action log stats
+        session_dir = self.state.session_dir
+        log_path    = str(session_dir / "actions.jsonl")
+        stats       = TR.summarise_action_log(log_path)
+
+        # Elapsed from session start
+        started = self.state.get("started_at")
+        elapsed = ""
+        if started:
+            try:
+                from datetime import datetime, timezone
+                start_dt = datetime.fromisoformat(started.replace("Z", "+00:00"))
+                delta    = datetime.now(timezone.utc) - start_dt
+                elapsed  = f"{int(delta.total_seconds())}s"
+            except Exception:
+                elapsed = "?"
 
         sev_counts: dict[str, int] = {}
         for f in findings:
             sev = f.get("severity", "info")
             sev_counts[sev] = sev_counts.get(sev, 0) + 1
 
-        print(f"  Phase          {phase}")
-        print(f"  Root obtained  {'YES ✓' if is_root else 'no'}")
-        print(f"  Sessions open  {len(sessions)}")
-        print(f"  Open ports     {len(ports)}")
-        print(f"  Findings       {len(findings)}  " + "  ".join(
-            f"{k}:{v}" for k, v in sev_counts.items()
-        ))
+        sev_str = "  ".join(f"{k}:{v}" for k, v in sev_counts.items())
+
+        print(f"{'─' * 50}")
+        print(f"  Kira Session Summary")
+        print(f"{'─' * 50}")
+        print(f"  Target          {self.state.target}")
+        print(f"  Final phase     {phase}")
+        print(f"  Root obtained   {'YES ✓' if is_root else 'no'}")
+        print(f"  Sessions open   {len(sessions)}")
+        print(f"  Open ports      {len(ports)}")
+        print(f"  Findings        {len(findings)}  {sev_str}")
+        print(f"  Actions run     {stats['total_actions']}  "
+              f"(ok={stats['successful']}  failed={stats['failed']})")
+        print(f"  Tools used      {', '.join(stats['tools_used']) or 'none'}")
+        if elapsed:
+            print(f"  Elapsed         {elapsed}")
+        print(f"  Session dir     {session_dir}")
+        print(f"{'─' * 50}")
 
         if findings:
-            print(f"\n  {C.BOLD}Top findings:{C.RESET}")
+            print(f"\n  Top findings:")
             for f in sorted(findings, key=lambda x: x.get("cvss", 0), reverse=True)[:5]:
                 sev = f.get("severity", "info").upper()
                 print(
-                    f"    [{sev:8s}] CVSS {f.get('cvss', '?'):<4}  "
+                    f"  [{sev:8s}] CVSS {f.get('cvss', '?'):<4}  "
                     f"port {f.get('port', '?'):<5}  {f.get('title', 'untitled')}"
                 )
+        print()
 
     def _print_welcome(self) -> None:
         """Print welcome banner."""

@@ -483,7 +483,7 @@ def main():
 
     # ── ToolRunner + KnowledgeBase ────────────────────────────────────────────
     runner = ToolRunner(session_dir=str(session_dir),
-                        verbose=verbose, msf=msf_client)
+                        verbose=True, msf=msf_client)
     kb = KnowledgeBase() if _KB_AVAILABLE else None
 
     avail   = runner.check_tools()
@@ -494,22 +494,58 @@ def main():
     if missing:
         print(f"{C.YELLOW}[WARN ] Missing:   {', '.join(missing)}{C.RESET}")
 
+    # ── StateManager ──────────────────────────────────────────────────────────
+    # Use a placeholder target until the user provides one via chat.
+    # KiraChat.re-inits state when a real target is given.
+    initial_target = args.target or ""
+    state = StateManager(session_dir=str(session_dir))
+    state.init(
+        target=initial_target or "pending",
+        authorized_by=args.authorized_by,
+    )
+
+    # ── Scope guardrails ──────────────────────────────────────────────────────
+    # Only validate target if one was provided on the CLI.
+    # If no target yet, create a permissive guard that validates per-action.
+    if initial_target:
+        guard = ScopeGuard(authorized_target=initial_target, authorized_by=args.authorized_by)
+        guard.validate_startup(log)
+    else:
+        guard = None  # KiraChat will create a real guard when target is set
+
+    # ── Phase transition logger hook ──────────────────────────────────────────
+    _orig_advance = state.advance_phase
+    def _logged_advance():
+        old = state.phase
+        new = _orig_advance()
+        if new != old:
+            log.phase(old, new)
+            _print_section(f"PHASE: {old} → {new}")
+        return new
+    state.advance_phase = _logged_advance
+
+    # ── Planner ────────────────────────────────────────────────────────────────
+    planner = Planner(
+        state=state,
+        runner=runner,
+        llm=llm,
+        msf=msf_client,
+        kb=kb,
+        verbose=True,   # always show step-by-step output
+        logger=log,
+        guard=guard,
+    )
+
     # ── Start KiraChat ─────────────────────────────────────────────────────────
     _print_section("KIRA CHAT")
-    
+
     try:
         chat = KiraChat(
-            runner=runner,
+            planner=planner,
+            state=state,
             llm=llm,
-            msf=msf_client,
-            kb=kb,
-            session_dir=session_dir,
-            log=log,
-            authorized_by=args.authorized_by,
             max_iter=args.max_iter,
             verbose=args.verbose,
-            initial_target=args.target,  # Optional target from CLI
-            no_report=args.no_report,
         )
         chat.start()
     except KeyboardInterrupt:
