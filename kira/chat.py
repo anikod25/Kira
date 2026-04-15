@@ -71,28 +71,19 @@ class KiraChat:
         llm: LLMClient,
         max_iter: int = 50,
         verbose: bool = True,
+        session_dir=None,
+        log=None,
+        no_report: bool = False,
     ):
-        """
-        Initialize KiraChat.
-
-        Parameters
-        ----------
-        planner : Planner
-            Existing Planner instance from main.py
-        state : StateManager
-            Existing StateManager instance
-        llm : LLMClient
-            Existing LLMClient instance (reused — no new connection)
-        max_iter : int
-            Maximum iterations to pass to planner.run()
-        verbose : bool
-            Enable verbose output
-        """
-        self.planner = planner
-        self.state = state
-        self.llm = llm
-        self.max_iter = max_iter
-        self.verbose = verbose
+        self.planner    = planner
+        self.state      = state
+        self.llm        = llm
+        self.max_iter   = max_iter
+        self.verbose    = verbose
+        self.session_dir = session_dir
+        self.log        = log
+        self.no_report  = no_report
+        self._last_report_path: str = None
 
     def start(self) -> None:
         """
@@ -120,6 +111,8 @@ class KiraChat:
             if user_input.lower() in self.EXIT_KEYWORDS:
                 self._print_goodbye()
                 break
+            elif self._is_report_request(user_input):
+                self._handle_report_request()
             elif self._is_scan_trigger(user_input):
                 self._handle_scan_trigger(user_input)
             else:
@@ -283,8 +276,73 @@ class KiraChat:
             print(f"  Tip: review {self.state.session_dir}/actions.jsonl to see why the agent stopped.")
         print()
 
+        # Auto-generate report
+        if not self.no_report:
+            self._generate_report(outcome)
+
         # Return to chat mode
         print()
+
+    def _generate_report(self, outcome: str = "DONE") -> None:
+        """Generate HTML + Markdown report and store the path."""
+        findings = self.state.get("findings") or []
+        if not findings:
+            print(f"{C.YELLOW}[KIRA]{C.RESET} No findings — skipping report generation.\n")
+            return
+
+        session_dir = self.session_dir or self.state.session_dir
+        print(f"\n{'─' * 50}")
+        print(f"  GENERATING REPORT")
+        print(f"{'─' * 50}")
+        try:
+            from kira.reporter import ReportGenerator
+            reporter = ReportGenerator(session_dir=str(session_dir), llm=self.llm)
+            paths    = reporter.generate()
+            self._last_report_path = paths.html
+            print(f"  ✓ Markdown : {paths.markdown}")
+            print(f"  ✓ HTML     : {paths.html}")
+            print(f"\n  Open with: xdg-open {paths.html}\n")
+            if self.log:
+                self.log.info(f"Report generated: {paths.html}")
+        except Exception as e:
+            print(f"  ✗ Report generation failed: {e}")
+            import traceback; traceback.print_exc()
+
+    def _is_report_request(self, message: str) -> bool:
+        """Detect if user is asking to see/open/generate the report."""
+        msg = message.lower()
+        return any(kw in msg for kw in [
+            "report", "html", "open report", "show report",
+            "generate report", "view report", "see report",
+        ])
+
+    def _handle_report_request(self) -> None:
+        """Handle a chat request to open or generate the report."""
+        session_dir = self.session_dir or self.state.session_dir
+        html_path   = self._last_report_path
+
+        # Check if report already exists on disk
+        if not html_path and session_dir:
+            candidate = session_dir / "report.html"
+            if candidate.exists():
+                html_path = str(candidate)
+
+        if html_path:
+            import webbrowser
+            from pathlib import Path as _Path
+            abs_path = _Path(html_path).resolve()
+            print(f"{C.GREEN}[KIRA]{C.RESET} Opening report: {abs_path}")
+            try:
+                webbrowser.open(f"file://{abs_path}")
+            except Exception:
+                print(f"{C.GREEN}[KIRA]{C.RESET} Run: xdg-open {abs_path}\n")
+        else:
+            findings = self.state.get("findings") or []
+            if findings:
+                print(f"{C.GREEN}[KIRA]{C.RESET} Generating report now...")
+                self._generate_report()
+            else:
+                print(f"{C.YELLOW}[KIRA]{C.RESET} No scan has been run yet — no report to show.\n")
 
     def _print_session_summary(self) -> None:
         """Print session summary matching the original Kira output format exactly."""

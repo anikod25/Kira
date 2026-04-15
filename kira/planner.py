@@ -635,20 +635,39 @@ class Planner:
         if self._msf is None:
             return []
         try:
+            # kira.msf_client.MSFClient wrapper
             if hasattr(self._msf, 'search'):
                 return self._msf.search(query) or []
-            # Raw pymetasploit3 — search via modules list
+            # Raw pymetasploit3 MsfRpcClient — use modules.search() API
+            if hasattr(self._msf, 'modules') and hasattr(self._msf.modules, 'search'):
+                raw = self._msf.modules.search(query)
+                results = []
+                for item in (raw or []):
+                    if isinstance(item, dict):
+                        name = item.get("fullname") or item.get("name", "")
+                    else:
+                        name = str(item)
+                    if name:
+                        results.append({"module": name, "type": "exploit"})
+                return results[:10]
+            # Last resort: scan module list (slow, avoid if possible)
             results = []
             for mtype in ["exploits", "auxiliary"]:
                 try:
                     mods = self._msf.modules.list(mtype)
-                    for name in mods:
-                        if query.lower() in name.lower():
+                    for name in (mods or []):
+                        if query.lower() in str(name).lower():
                             results.append({"module": f"{mtype.rstrip('s')}/{name}", "type": mtype})
+                            if len(results) >= 10:
+                                break
                 except Exception:
                     continue
-            return results[:10]
-        except Exception:
+                if len(results) >= 10:
+                    break
+            return results
+        except Exception as e:
+            if self._verbose:
+                self._print_warn(f"msf_search error: {e}")
             return []
 
     def _do_shell_cmd(self, args: dict) -> str:

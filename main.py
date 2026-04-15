@@ -546,6 +546,9 @@ def main():
             llm=llm,
             max_iter=args.max_iter,
             verbose=args.verbose,
+            session_dir=session_dir,
+            log=log,
+            no_report=args.no_report,
         )
         chat.start()
     except KeyboardInterrupt:
