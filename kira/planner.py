@@ -113,7 +113,7 @@ class Planner:
     Observe → Think → Act agent loop for Kira.
     """
 
-    MAX_SAME_ACTION = 3
+    MAX_SAME_ACTION = 5
 
     def __init__(
         self,

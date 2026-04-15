@@ -213,6 +213,27 @@ class KiraChat:
         except Exception as e:
             print(f"{C.YELLOW}[KIRA]{C.RESET} Error: {e}\n")
 
+    def _extract_iterations(self, message: str) -> Optional[int]:
+        """
+        Extract iteration count from message.
+        Handles: 'iterations = 50', 'iterations=50', '50 iterations', 'iter 50'
+        """
+        import re
+        patterns = [
+            r'iterations?\s*[=:]\s*(\d+)',
+            r'(\d+)\s*iterations?',
+            r'iter\s*[=:]\s*(\d+)',
+            r'(\d+)\s*iter\b',
+            r'max[_\s]iter\s*[=:]\s*(\d+)',
+        ]
+        for pat in patterns:
+            m = re.search(pat, message, re.IGNORECASE)
+            if m:
+                val = int(m.group(1))
+                if 1 <= val <= 500:
+                    return val
+        return None
+
     def _handle_scan_trigger(self, message: str) -> None:
         """
         Scan mode: Extract IP, update target if needed, run planner, return to chat.
@@ -246,15 +267,20 @@ class KiraChat:
         self.planner._guard = guard
 
         # Confirmation + old-style header to match original output
+        # Check if user specified a custom iteration count in the message
+        custom_iter = self._extract_iterations(message)
+        max_iter    = custom_iter if custom_iter else self.max_iter
+        if custom_iter:
+            print(f"{C.GREEN}[KIRA]{C.RESET} Using {custom_iter} iterations as requested.\n")
         print(f"\n{'─' * 50}")
         print(f"  STARTING AGENT LOOP")
         print(f"{'─' * 50}")
         print(f"\n\033[1m\033[92m[KIRA] Agent loop starting...\033[0m")
-        print(f"\033[2m       Target: {target}  |  Max iterations: {self.max_iter}\033[0m\n")
+        print(f"\033[2m       Target: {target}  |  Max iterations: {max_iter}\033[0m\n")
 
         # Run the planner synchronously
         try:
-            outcome = self.planner.run(max_iterations=self.max_iter)
+            outcome = self.planner.run(max_iterations=max_iter)
         except KeyboardInterrupt:
             outcome = "INTERRUPTED"
             print(f"\n\033[93m[KIRA] Interrupted by user.\033[0m\n")

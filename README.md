@@ -228,12 +228,22 @@ Once running, Kira presents a conversational prompt:
 kira> find vulnerabilities at 10.163.172.51
 ```
 
-Kira detects the IP + trigger word and starts the autonomous scan. You can also ask questions:
+Kira detects the IP + trigger word and starts the autonomous scan. You can control the iteration count inline:
+
+```
+kira> find vulnerabilities at 10.163.172.51 iterations = 50
+kira> scan 10.163.172.51 iter=100
+kira> start pentest on 10.163.172.51 max_iter=30
+```
+
+You can also ask questions at any time:
 
 ```
 kira> what is CVE-2021-41773?
 kira> explain the findings so far
 kira> what should I do next?
+kira> show report
+kira> open report
 ```
 
 Type `exit` to quit.
