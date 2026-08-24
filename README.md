@@ -24,7 +24,7 @@ _  ___
 ---
 ## Documentation
 
- **[Read the full Kira Documentation →](https://kira-documentation.vercel.app/)**
+ [Read the full Kira Documentation →](https://kira-documentation.vercel.app/)
 ---
 ## What Kira Does
 
