@@ -22,7 +22,10 @@ _  ___
 </div>
 
 ---
+## Documentation
 
+ **[Read the full Kira Documentation →](https://kira-documentation.vercel.app/)**
+---
 ## What Kira Does
 
 ```
